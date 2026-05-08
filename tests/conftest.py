@@ -18,6 +18,111 @@ import more_itertools
 import pytest
 import pytestskipmarkers
 
+TESTS_DIR = pathlib.Path(__file__).resolve().parent
+PYTESTS_DIR = TESTS_DIR / "pytests"
+CODE_DIR = TESTS_DIR.parent
+os.chdir(str(CODE_DIR))
+if str(CODE_DIR) in sys.path:
+    sys.path.remove(str(CODE_DIR))
+if os.environ.get("ONEDIR_TESTRUN", "0") == "0":
+    sys.path.insert(0, str(CODE_DIR))
+
+
+def _pin_multiprocessing_fork_for_tests() -> None:
+    """
+    Python 3.14 changed the Linux default ``multiprocessing`` start method
+    from ``fork`` to ``forkserver``. Forkserver spawns a fresh interpreter
+    and pickles the target callable across; that breaks tests that pass
+    ``TestCase`` staticmethods or other non-importable callables to
+    ``multiprocessing.Process`` (the child fails with ``ModuleNotFoundError:
+    No module named 'tests'`` because pytest's dynamic ``tests/`` import
+    path is not propagated to the fresh interpreter when running under
+    ``ONEDIR_TESTRUN``). Pin the test session to ``fork`` so we keep
+    Py3.13 semantics for the test suite while production daemons get the
+    same pinning via ``salt/scripts.py``.
+
+    Linux-only on purpose: macOS and Windows have always defaulted to spawn
+    and salt-on-darwin/win is written for that. Forcing fork on Darwin
+    silently corrupts workers via libdispatch's "fork after thread init"
+    rule (symptom: minions accept jobs but never respond).
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import multiprocessing as _mp
+    except ImportError:
+        return
+    if _mp.get_start_method(allow_none=True) is None:
+        try:
+            _mp.set_start_method("fork")
+        except (RuntimeError, ValueError):
+            pass
+
+
+_pin_multiprocessing_fork_for_tests()
+
+
+def _patch_psutil_pidfd_open_einval() -> None:
+    """
+    psutil 7.x calls ``os.pidfd_open(pid, 0)`` to wait for a process.
+    On some Linux kernels (e.g. systemd-managed daemons whose pid was
+    already reaped, or arm64 6.x boxes) ``pidfd_open`` returns ``EINVAL``
+    instead of ``ESRCH`` for a non-existent pid. psutil's
+    ``wait_pid_pidfd_open`` only falls back to the legacy ``waitpid`` path
+    for ``ESRCH``/``EMFILE``/``ENFILE``/``ENODEV`` -- ``EINVAL`` propagates
+    out of fixture teardown and shows up as ``ERROR at teardown of <test>``
+    even when the test itself was skipped or passed. Treat ``EINVAL`` the
+    same as ``ESRCH``.
+    """
+    try:
+        import errno as _errno
+
+        from psutil import _psposix
+    except ImportError:
+        return
+    if getattr(_psposix.wait_pid_pidfd_open, "_salt_einval_wrap", False):
+        return
+    original = _psposix.wait_pid_pidfd_open
+
+    def wrapper(pid, timeout=None):
+        try:
+            return original(pid, timeout)
+        except OSError as exc:
+            if exc.errno == _errno.EINVAL:
+                return _psposix.wait_pid_posix(pid, timeout)
+            raise
+
+    wrapper._salt_einval_wrap = True
+    _psposix.wait_pid_pidfd_open = wrapper
+
+
+_patch_psutil_pidfd_open_einval()
+
+
+def _remove_redundant_salt_utils_vault_py() -> None:
+    """
+    Onedir artifacts may contain both ``salt/utils/vault.py`` (legacy) and the
+    ``salt/utils/vault/`` package. Delete the stray module before importing
+    Salt so the lazy loader never records a module/package collision.
+    """
+    for path in list(sys.path):
+        if not path:
+            continue
+        redundant = pathlib.Path(path) / "salt" / "utils" / "vault.py"
+        if redundant.is_file():
+            try:
+                redundant.unlink()
+            except OSError:
+                pass
+            for pyc in redundant.parent.glob("__pycache__/vault.cpython-*.pyc"):
+                try:
+                    pyc.unlink()
+                except OSError:
+                    pass
+
+
+_remove_redundant_salt_utils_vault_py()
+
 import salt
 import salt._logging
 import salt._logging.mixins
@@ -36,19 +141,6 @@ from tests.support.helpers import (
 from tests.support.pytest.helpers import *  # pylint: disable=unused-wildcard-import,wildcard-import
 from tests.support.runtests import RUNTIME_VARS
 from tests.support.sminion import check_required_sminion_attributes, create_sminion
-
-TESTS_DIR = pathlib.Path(__file__).resolve().parent
-PYTESTS_DIR = TESTS_DIR / "pytests"
-CODE_DIR = TESTS_DIR.parent
-
-# Change to code checkout directory
-os.chdir(str(CODE_DIR))
-
-# Make sure the current directory is the first item in sys.path
-if str(CODE_DIR) in sys.path:
-    sys.path.remove(str(CODE_DIR))
-if os.environ.get("ONEDIR_TESTRUN", "0") == "0":
-    sys.path.insert(0, str(CODE_DIR))
 
 os.environ["REPO_ROOT_DIR"] = str(CODE_DIR)
 
@@ -809,6 +901,11 @@ def salt_factories_default_root_dir(salt_factories_default_root_dir):
         ).resolve()
         return tempdir / "stsuite"
 
+    # Set ``SALT_PYTEST_FACTORIES_ROOT`` to a writable directory (e.g.
+    # ``$TMPDIR/salt-factories-stsuite``) to avoid using ``/tmp/stsuite``.
+    env_root = os.environ.get("SALT_PYTEST_FACTORIES_ROOT")
+    if env_root:
+        return pathlib.Path(env_root)
     return salt_factories_default_root_dir / "stsuite"
 
 
@@ -817,10 +914,18 @@ def salt_factories_config():
     """
     Return a dictionary with the keyworkd arguments for FactoriesManager
     """
-    if os.environ.get("JENKINS_URL") or os.environ.get("CI"):
+    if (
+        os.environ.get("JENKINS_URL")
+        or os.environ.get("CI")
+        or os.environ.get("ONEDIR_TESTRUN") == "1"
+    ):
         start_timeout = 120
     else:
         start_timeout = 60
+
+    # Windows minion/master startup and event wiring are slower than Linux (often >120s to minion start).
+    if salt.utils.platform.is_windows():
+        start_timeout = max(start_timeout, 240)
 
     if os.environ.get("ONEDIR_TESTRUN", "0") == "1":
         code_dir = None
@@ -978,7 +1083,11 @@ def salt_syndic_master_factory(
     prod_env_state_tree_root_dir,
     prod_env_pillar_tree_root_dir,
 ):
-    root_dir = salt_factories.get_root_dir_for_daemon("syndic_master")
+    import saltfactories.daemons.master
+
+    root_dir = salt_factories.get_root_dir_for_daemon(
+        "syndic_master", factory_class=saltfactories.daemons.master.SaltMaster
+    )
     conf_dir = root_dir / "conf"
     conf_dir.mkdir(exist_ok=True)
 
@@ -1058,12 +1167,18 @@ def salt_syndic_master_factory(
         }
     )
 
+    factory_kwargs = {}
+    if salt_factories.system_service is False:
+        factory_kwargs["extra_cli_arguments_after_first_start_failure"] = [
+            "--log-level=info"
+        ]
+
     factory = salt_factories.salt_master_daemon(
         "syndic_master",
         order_masters=True,
         defaults=config_defaults,
         overrides=config_overrides,
-        extra_cli_arguments_after_first_start_failure=["--log-level=info"],
+        **factory_kwargs,
     )
     return factory
 
@@ -1079,11 +1194,17 @@ def salt_syndic_factory(salt_factories, salt_syndic_master_factory):
         opts["transport"] = salt_syndic_master_factory.config["transport"]
         config_defaults["syndic"] = opts
     config_overrides = {"log_level_logfile": "info"}
+    factory_kwargs = {}
+    if salt_factories.system_service is False:
+        factory_kwargs["extra_cli_arguments_after_first_start_failure"] = [
+            "--log-level=info"
+        ]
+
     factory = salt_syndic_master_factory.salt_syndic_daemon(
         "syndic",
         defaults=config_defaults,
         overrides=config_overrides,
-        extra_cli_arguments_after_first_start_failure=["--log-level=info"],
+        **factory_kwargs,
     )
     return factory
 
@@ -1099,7 +1220,11 @@ def salt_master_factory(
     ext_pillar_file_tree_root_dir,
     salt_api_account_factory,
 ):
-    root_dir = salt_factories.get_root_dir_for_daemon("master")
+    import saltfactories.daemons.master
+
+    root_dir = salt_factories.get_root_dir_for_daemon(
+        "master", factory_class=saltfactories.daemons.master.SaltMaster
+    )
     conf_dir = root_dir / "conf"
     conf_dir.mkdir(exist_ok=True)
 
@@ -1208,17 +1333,23 @@ def salt_master_factory(
         else:
             shutil.copyfile(source, dest)
 
+    factory_kwargs = {}
+    if salt_factories.system_service is False:
+        factory_kwargs["extra_cli_arguments_after_first_start_failure"] = [
+            "--log-level=info"
+        ]
+
     factory = salt_syndic_master_factory.salt_master_daemon(
         "master",
         defaults=config_defaults,
         overrides=config_overrides,
-        extra_cli_arguments_after_first_start_failure=["--log-level=info"],
+        **factory_kwargs,
     )
     return factory
 
 
 @pytest.fixture(scope="session")
-def salt_minion_factory(salt_master_factory):
+def salt_minion_factory(salt_factories, salt_master_factory):
     with salt.utils.files.fopen(os.path.join(RUNTIME_VARS.CONF_DIR, "minion")) as rfh:
         config_defaults = yaml.deserialize(rfh.read())
     config_defaults["hosts.file"] = os.path.join(RUNTIME_VARS.TMP, "hosts")
@@ -1237,11 +1368,18 @@ def salt_minion_factory(salt_master_factory):
     virtualenv_binary = get_virtualenv_binary_path()
     if virtualenv_binary:
         config_overrides["venv_bin"] = virtualenv_binary
+
+    factory_kwargs = {}
+    if salt_factories.system_service is False:
+        factory_kwargs["extra_cli_arguments_after_first_start_failure"] = [
+            "--log-level=info"
+        ]
+
     factory = salt_master_factory.salt_minion_daemon(
         "minion",
         defaults=config_defaults,
         overrides=config_overrides,
-        extra_cli_arguments_after_first_start_failure=["--log-level=info"],
+        **factory_kwargs,
     )
     factory.after_terminate(
         pytest.helpers.remove_stale_minion_key, salt_master_factory, factory.id
@@ -1250,7 +1388,7 @@ def salt_minion_factory(salt_master_factory):
 
 
 @pytest.fixture(scope="session")
-def salt_sub_minion_factory(salt_master_factory):
+def salt_sub_minion_factory(salt_factories, salt_master_factory):
     with salt.utils.files.fopen(
         os.path.join(RUNTIME_VARS.CONF_DIR, "sub_minion")
     ) as rfh:
@@ -1271,11 +1409,18 @@ def salt_sub_minion_factory(salt_master_factory):
     virtualenv_binary = get_virtualenv_binary_path()
     if virtualenv_binary:
         config_overrides["venv_bin"] = virtualenv_binary
+
+    factory_kwargs = {}
+    if salt_factories.system_service is False:
+        factory_kwargs["extra_cli_arguments_after_first_start_failure"] = [
+            "--log-level=info"
+        ]
+
     factory = salt_master_factory.salt_minion_daemon(
         "sub_minion",
         defaults=config_defaults,
         overrides=config_overrides,
-        extra_cli_arguments_after_first_start_failure=["--log-level=info"],
+        **factory_kwargs,
     )
     factory.after_terminate(
         pytest.helpers.remove_stale_minion_key, salt_master_factory, factory.id
@@ -1308,6 +1453,11 @@ def salt_call_cli(salt_minion_factory):
     return salt_minion_factory.salt_call_cli()
 
 
+def pytest_sessionstart(session):
+    # Belt-and-suspenders if anything reintroduced vault.py after process start
+    _remove_redundant_salt_utils_vault_py()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def bridge_pytest_and_runtests(
     salt_factories,
@@ -1318,6 +1468,8 @@ def bridge_pytest_and_runtests(
     salt_sub_minion_factory,
     sshd_config_dir,
 ):
+    import salt.config
+
     # Make sure unittest2 uses the pytest generated configuration
     RUNTIME_VARS.RUNTIME_CONFIGS["master"] = freeze(salt_master_factory.config)
     RUNTIME_VARS.RUNTIME_CONFIGS["minion"] = freeze(salt_minion_factory.config)
@@ -1352,13 +1504,22 @@ def bridge_pytest_and_runtests(
 
 @pytest.fixture(scope="session")
 def sshd_config_dir(salt_factories):
-    config_dir = salt_factories.get_root_dir_for_daemon("sshd")
+    import saltfactories.daemons.sshd
+
+    config_dir = salt_factories.get_root_dir_for_daemon(
+        "sshd", factory_class=saltfactories.daemons.sshd.Sshd
+    )
     yield config_dir
     shutil.rmtree(str(config_dir), ignore_errors=True)
 
 
 @pytest.fixture(scope="module")
 def sshd_server(salt_factories, sshd_config_dir, salt_master, grains):
+    if not shutil.which("sshd"):
+        pytest.skip(
+            "The 'sshd' binary was not found on PATH; install an OpenSSH server "
+            "package (for example openssh-server) to run SSH integration tests."
+        )
     sshd_config_dict = {
         "Protocol": "2",
         # Turn strict modes off so that we can operate in /tmp
