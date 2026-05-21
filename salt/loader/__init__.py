@@ -26,7 +26,7 @@ import salt.utils.lazy
 import salt.utils.platform
 import salt.utils.stringutils
 import salt.utils.versions
-from salt.exceptions import LoaderError
+from salt.exceptions import LoaderError, SaltDeserializationError
 from salt.template import check_render_pipe_str
 from salt.utils import entrypoints
 
@@ -250,17 +250,7 @@ def _module_dirs(
         if os.path.isdir(maybe_dir):
             cli_module_dirs.insert(0, maybe_dir)
 
-    if opts.get("features", {}).get(
-        "enable_deprecated_module_search_path_priority", False
-    ):
-        salt.utils.versions.warn_until(
-            3008,
-            "The old module search path priority will be removed in Salt 3008. "
-            "For more information see https://github.com/saltstack/salt/pull/65938.",
-        )
-        return cli_module_dirs + ext_type_types + ext_types + sys_types
-    else:
-        return cli_module_dirs + ext_types + ext_type_types + sys_types
+    return cli_module_dirs + ext_types + ext_type_types + sys_types
 
 
 def minion_mods(
@@ -273,6 +263,7 @@ def minion_mods(
     notify=False,
     static_modules=None,
     proxy=None,
+    pillar=None,
     file_client=None,
 ):
     """
@@ -316,17 +307,20 @@ def minion_mods(
     # TODO Publish documentation for module whitelisting
     if not whitelist:
         whitelist = opts.get("whitelist_modules", None)
+    pack = {
+        "__context__": context,
+        "__utils__": utils,
+        "__proxy__": proxy,
+        "__opts__": opts,
+        "__file_client__": file_client,
+    }
+    if pillar is not None:
+        pack["__pillar__"] = pillar
     ret = LazyLoader(
         _module_dirs(opts, "modules", "module"),
         opts,
         tag="module",
-        pack={
-            "__context__": context,
-            "__utils__": utils,
-            "__proxy__": proxy,
-            "__opts__": opts,
-            "__file_client__": file_client,
-        },
+        pack=pack,
         whitelist=whitelist,
         loaded_base_name=loaded_base_name,
         static_modules=static_modules,
@@ -423,19 +417,35 @@ def metaproxy(opts, loaded_base_name=None):
     )
 
 
-def matchers(opts, loaded_base_name=None):
+def matchers(opts, loaded_base_name=None, context=None, pillar=None):
     """
     Return the matcher services plugins
 
     :param dict opts: The Salt options dictionary
     :param str loaded_base_name: The imported modules namespace when imported
                                  by the salt loader.
+    :param dict context: The Salt context dictionary
+    :param dict pillar: The Salt pillar dictionary
     """
+    if context is None:
+        context = {}
+
+    pack = {
+        "__salt__": {},
+        "__runners__": {},
+        "__grains__": opts.get("grains", {}),
+        "__context__": context,
+        "__file_client__": None,
+    }
+    if pillar is not None:
+        pack["__pillar__"] = pillar
+
     return LazyLoader(
         _module_dirs(opts, "matchers"),
         opts,
         tag="matchers",
         loaded_base_name=loaded_base_name,
+        pack=pack,
     )
 
 
@@ -536,6 +546,7 @@ def utils(
     context=None,
     proxy=None,
     file_client=None,
+    pillar=None,
     pack_self=None,
     loaded_base_name=None,
 ):
@@ -550,6 +561,9 @@ def utils(
     :param str loaded_base_name: The imported modules namespace when imported
                                  by the salt loader.
     """
+    pack = {"__context__": context, "__proxy__": proxy or {}}
+    if pillar is not None:
+        pack["__pillar__"] = pillar
     return LazyLoader(
         _module_dirs(opts, "utils", ext_type_dirs="utils_dirs", load_extensions=False),
         opts,
@@ -566,7 +580,7 @@ def utils(
     )
 
 
-def pillars(opts, functions, context=None, loaded_base_name=None):
+def pillars(opts, functions, context=None, pillar=None, loaded_base_name=None):
     """
     Returns the pillars modules
 
@@ -578,11 +592,14 @@ def pillars(opts, functions, context=None, loaded_base_name=None):
                                  by the salt loader.
     """
     _utils = utils(opts)
+    pack = {"__salt__": functions, "__context__": context, "__utils__": _utils}
+    if pillar is not None:
+        pack["__pillar__"] = pillar
     ret = LazyLoader(
         _module_dirs(opts, "pillar"),
         opts,
         tag="pillar",
-        pack={"__salt__": functions, "__context__": context, "__utils__": _utils},
+        pack=pack,
         extra_module_dirs=_utils.module_dirs,
         pack_self="__ext_pillar__",
         loaded_base_name=loaded_base_name,
@@ -926,6 +943,7 @@ def render(
     proxy=None,
     context=None,
     file_client=None,
+    pillar=None,
     loaded_base_name=None,
 ):
     """
@@ -949,6 +967,8 @@ def render(
         "__context__": context,
         "__file_client__": file_client,
     }
+    if pillar is not None:
+        pack["__pillar__"] = pillar
 
     if states:
         pack["__states__"] = states
@@ -1078,7 +1098,11 @@ def _load_cached_grains(opts, cfn):
             return None
 
         return _format_cached_grains(cached_grains)
-    except OSError:
+    except (OSError, SaltDeserializationError):
+        log.debug(
+            "Grains cache was not readable or did not deserialize and might be corrupted. Refreshing.",
+            exc_info=True,
+        )
         return None
 
 

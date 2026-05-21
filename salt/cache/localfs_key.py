@@ -22,6 +22,11 @@ import errno
 import logging
 import os
 import os.path
+
+try:
+    import pwd
+except ImportError:
+    pwd = None
 import shutil
 import stat
 import tempfile
@@ -86,6 +91,7 @@ def store(bank, key, data, cachedir, user, **kwargs):
     Store key state information. storing a accepted/pending/rejected state
     means clearing it from the other 2. denied is handled separately
     """
+    base = None
     if bank in ["keys", "denied_keys"] and not valid_id(__opts__, key):
         raise SaltCacheError(f"key {key} is not a valid minion_id")
 
@@ -121,32 +127,30 @@ def store(bank, key, data, cachedir, user, **kwargs):
             cachedir = __opts__["pki_dir"]
 
     savefn = Path(cachedir) / base / key
-    base = savefn.parent
+    base_dir = savefn.parent
 
     if not clean_path(cachedir, str(savefn), subdir=True):
         raise SaltCacheError(f"key {key} is not a valid key path.")
 
     try:
-        os.makedirs(base)
+        os.makedirs(base_dir)
     except OSError as exc:
         if exc.errno != errno.EEXIST:
             raise SaltCacheError(
-                f"The cache directory, {base}, could not be created: {exc}"
+                f"The cache directory, {base_dir}, could not be created: {exc}"
             )
 
     # delete current state before re-serializing new state
     flush(bank, key, cachedir, **kwargs)
 
-    tmpfh, tmpfname = tempfile.mkstemp(dir=base)
+    tmpfh, tmpfname = tempfile.mkstemp(dir=base_dir)
     os.close(tmpfh)
 
-    if user:
+    if user and not salt.utils.platform.is_windows():
         try:
-            import pwd
-
             uid = pwd.getpwnam(user).pw_uid
             os.chown(tmpfname, uid, -1)
-        except (KeyError, ImportError, OSError):
+        except (KeyError, ImportError, OSError, NameError):
             # The specified user was not found, allow the backup systems to
             # report the error
             pass
@@ -316,12 +320,14 @@ def flush(bank, key=None, cachedir=None, **kwargs):
         except OSError as exc:
             if exc.errno != errno.ENOENT:
                 raise SaltCacheError(f'There was an error removing "{target}": {exc}')
+
     return flushed
 
 
 def list_(bank, cachedir, **kwargs):
     """
     Return an iterable object containing all entries stored in the specified bank.
+    Uses internal mmap index for O(1) performance when available.
     """
     if bank == "keys":
         bases = [base for base in BASE_MAPPING if base != "minions_denied"]
@@ -345,21 +351,109 @@ def list_(bank, cachedir, **kwargs):
             )
         for item in items:
             # salt foolishly dumps a file here for key cache, ignore it
+            if item == ".key_cache":
+                continue
+
             keyfile = Path(cachedir, base, item)
 
             if (
                 bank in ["keys", "denied_keys"] and not valid_id(__opts__, item)
             ) or not clean_path(cachedir, str(keyfile), subdir=True):
                 log.error("saw invalid id %s, discarding", item)
+                continue
 
             if keyfile.is_file() and not keyfile.is_symlink():
                 ret.append(item)
     return ret
 
 
+def list_all(bank, cachedir, include_data=False, **kwargs):
+    """
+    Return all entries with their data from the specified bank.
+    This is much faster than calling list() + fetch() for each item.
+    Returns a dict of {key: data}.
+
+    If include_data is False (default), only the state is returned for 'keys' bank,
+    avoiding expensive file reads.
+    """
+    if bank not in ["keys", "denied_keys"]:
+        raise SaltCacheError(f"Unrecognized bank: {bank}")
+
+    ret = {}
+
+    if bank == "keys":
+        # Map directory names to states
+        state_mapping = {
+            "minions": "accepted",
+            "minions_pre": "pending",
+            "minions_rejected": "rejected",
+        }
+
+        for dir_name, state in state_mapping.items():
+            dir_path = os.path.join(cachedir, dir_name)
+            if not os.path.isdir(dir_path):
+                continue
+
+            try:
+                with os.scandir(dir_path) as it:
+                    for entry in it:
+                        if not entry.is_file() or entry.is_symlink():
+                            continue
+                        if entry.name.startswith("."):
+                            continue
+                        if not valid_id(__opts__, entry.name):
+                            continue
+                        if not clean_path(cachedir, entry.path, subdir=True):
+                            continue
+
+                        if include_data:
+
+                            # Read the public key
+                            try:
+                                with salt.utils.files.fopen(entry.path, "r") as fh_:
+                                    pub_key = fh_.read()
+                                ret[entry.name] = {"state": state, "pub": pub_key}
+                            except OSError as exc:
+                                log.error(
+                                    "Error reading key file %s: %s", entry.path, exc
+                                )
+                        else:
+                            # Just return the state, no disk read
+                            ret[entry.name] = {"state": state}
+            except OSError as exc:
+                log.error("Error scanning directory %s: %s", dir_path, exc)
+
+    elif bank == "denied_keys":
+        # Denied keys work differently - multiple keys per minion ID
+        dir_path = os.path.join(cachedir, "minions_denied")
+        if os.path.isdir(dir_path):
+            try:
+                with os.scandir(dir_path) as it:
+                    for entry in it:
+                        if not entry.is_file() or entry.is_symlink():
+                            continue
+                        if not valid_id(__opts__, entry.name):
+                            continue
+                        if not clean_path(cachedir, entry.path, subdir=True):
+                            continue
+
+                        try:
+                            with salt.utils.files.fopen(entry.path, "r") as fh_:
+                                ret[entry.name] = fh_.read()
+                        except OSError as exc:
+                            log.error(
+                                "Error reading denied key %s: %s", entry.path, exc
+                            )
+            except OSError as exc:
+                log.error("Error scanning denied keys directory: %s", exc)
+
+    return ret
+
+
 def contains(bank, key, cachedir, **kwargs):
     """
     Checks if the specified bank contains the specified key.
+    Uses internal mmap index for O(1) performance when available.
     """
     if bank in ["keys", "denied_keys"] and not valid_id(__opts__, key):
         raise SaltCacheError(f"key {key} is not a valid minion_id")

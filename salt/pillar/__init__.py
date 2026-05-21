@@ -418,6 +418,12 @@ class Pillar:
         self.client = salt.fileclient.get_file_client(self.opts, True)
         self.fileclient = salt.fileclient.get_file_client(self.opts, False)
         self.avail = self.__gather_avail()
+        self.pillar_data = self.opts.get("pillar", {})
+        if not isinstance(self.pillar_data, dict):
+            self.pillar_data = {}
+        else:
+            # Ensure we have a plain dict and not a proxy into opts
+            self.pillar_data = dict(self.pillar_data)
 
         if opts.get("file_client", "") == "local" and not opts.get(
             "use_master_when_local", False
@@ -432,20 +438,30 @@ class Pillar:
                     opts,
                     utils=utils,
                     file_client=salt.fileclient.ContextlessFileClient(self.fileclient),
+                    pillar=self.pillar_data,
                 )
             else:
                 self.functions = salt.loader.minion_mods(
                     self.opts,
                     utils=utils,
                     file_client=salt.fileclient.ContextlessFileClient(self.fileclient),
+                    pillar=self.pillar_data,
                 )
         else:
             self.functions = functions
+            if hasattr(self.functions, "pack"):
+                self.functions.pack["__pillar__"] = self.pillar_data
 
         self.opts["minion_id"] = minion_id
-        self.matchers = salt.loader.matchers(self.opts)
+        self.matchers = salt.loader.matchers(self.opts, pillar=self.pillar_data)
+        if hasattr(self.matchers, "pack"):
+            self.matchers.pack["__pillar__"] = self.pillar_data
         self.rend = salt.loader.render(
-            self.opts, self.functions, self.client, file_client=self.client
+            self.opts,
+            self.functions,
+            self.client,
+            file_client=self.client,
+            pillar=self.pillar_data,
         )
         ext_pillar_opts = copy.deepcopy(self.opts)
         # Keep the incoming opts ID intact, ie, the master id
@@ -455,7 +471,17 @@ class Pillar:
         if opts.get("pillar_source_merging_strategy"):
             self.merge_strategy = opts["pillar_source_merging_strategy"]
 
-        self.ext_pillars = salt.loader.pillars(ext_pillar_opts, self.functions)
+        self.ext_pillars = salt.loader.pillars(
+            ext_pillar_opts, self.functions, pillar=self.pillar_data
+        )
+        if opts.get("extension_modules"):
+            for loader in (self.ext_pillars, self.matchers):
+                if hasattr(loader, "_refresh_file_mapping"):
+                    loader._refresh_file_mapping()
+                elif hasattr(loader, "_dict") and hasattr(
+                    loader._dict, "_refresh_file_mapping"
+                ):
+                    loader._dict._refresh_file_mapping()
         self.ignored_pillars = {}
         self.pillar_override = pillar_override or {}
         if not isinstance(self.pillar_override, dict):
@@ -737,7 +763,8 @@ class Pillar:
         """
         matches = {}
         if reload:
-            self.matchers = salt.loader.matchers(self.opts)
+            self.matchers = salt.loader.matchers(self.opts, pillar=self.pillar_data)
+            self._update_loader_packs()
         for saltenv, body in top.items():
             if self.opts["pillarenv"]:
                 if saltenv != self.opts["pillarenv"]:
@@ -1110,29 +1137,49 @@ class Pillar:
         top, top_errors = self.get_top()
         if ext:
             if self.opts.get("ext_pillar_first", False):
-                self.opts["pillar"], errors = self.ext_pillar(self.pillar_override)
-                self.rend = salt.loader.render(self.opts, self.functions)
+                pillar, errors = self.ext_pillar(self.pillar_override)
+                self.pillar_data.update(pillar)
+                self._update_loader_packs()
+                self.rend = salt.loader.render(
+                    self.opts,
+                    self.functions,
+                    self.client,
+                    file_client=self.client,
+                    pillar=self.pillar_data,
+                )
                 matches = self.top_matches(top, reload=True)
                 pillar, errors = self.render_pillar(matches, errors=errors)
                 pillar = merge(
-                    self.opts["pillar"],
+                    self.pillar_data,
                     pillar,
                     self.merge_strategy,
                     self.opts.get("renderer", "yaml"),
                     self.opts.get("pillar_merge_lists", False),
                 )
+                self.pillar_data.update(pillar)
+                self._update_loader_packs()
             else:
                 matches = self.top_matches(top)
                 pillar, errors = self.render_pillar(matches)
-                pillar, errors = self.ext_pillar(pillar, errors=errors)
+                self.pillar_data.update(pillar)
+                self._update_loader_packs()
+                pillar, errors = self.ext_pillar(self.pillar_data, errors=errors)
+                self.pillar_data.update(pillar)
+                self._update_loader_packs()
         else:
             matches = self.top_matches(top)
             pillar, errors = self.render_pillar(matches)
+            self.pillar_data.update(pillar)
+            self._update_loader_packs()
+
+        pillar = self.pillar_data
         errors.extend(top_errors)
         if self.opts.get("pillar_opts", False):
-            mopts = dict(self.opts)
-            if "grains" in mopts:
-                mopts.pop("grains")
+            mopts = {}
+            for key, val in self.opts.items():
+                if key in ("pillar", "__context__", "functions", "matchers", "rend"):
+                    continue
+                mopts[key] = val
             mopts["saltversion"] = __version__
             pillar["master"] = mopts
         if "pillar" in self.opts and self.opts.get("ssh_merge_pillar", False):
@@ -1160,7 +1207,60 @@ class Pillar:
         decrypt_errors = self.decrypt_pillar(pillar)
         if decrypt_errors:
             pillar.setdefault("_errors", []).extend(decrypt_errors)
+        self.pillar_data.update(pillar)
+        self._update_loader_packs()
         return pillar
+
+    def _update_loader_packs(self):
+        """
+        Update the loader packs with the current pillar data
+        """
+        for loader in (self.functions, self.matchers):
+            if hasattr(loader, "pack"):
+                if "__pillar__" in loader.pack:
+                    if loader.pack["__pillar__"] is self.pillar_data:
+                        continue
+                    if isinstance(loader.pack["__pillar__"], dict):
+                        loader.pack["__pillar__"].clear()
+                        loader.pack["__pillar__"].update(self.pillar_data)
+                    else:
+                        loader.pack["__pillar__"] = self.pillar_data
+                else:
+                    loader.pack["__pillar__"] = self.pillar_data
+
+        # Also update matchers in context if they exist
+        context = {}
+        if hasattr(self.functions, "pack"):
+            context = self.functions.pack.get("__context__", {})
+        if not context and hasattr(self.matchers, "pack"):
+            context = self.matchers.pack.get("__context__", {})
+
+        if hasattr(context, "value"):
+            context = context.value()
+
+        if isinstance(context, dict) and "matchers" in context:
+            m = context["matchers"]
+            if hasattr(m, "pack"):
+                if "__pillar__" in m.pack:
+                    if m.pack["__pillar__"] is not self.pillar_data:
+                        if isinstance(m.pack["__pillar__"], dict):
+                            m.pack["__pillar__"].clear()
+                            m.pack["__pillar__"].update(self.pillar_data)
+                        else:
+                            m.pack["__pillar__"] = self.pillar_data
+                else:
+                    m.pack["__pillar__"] = self.pillar_data
+
+        if hasattr(self.rend, "pack"):
+            if "__pillar__" in self.rend.pack:
+                if self.rend.pack["__pillar__"] is not self.pillar_data:
+                    if isinstance(self.rend.pack["__pillar__"], dict):
+                        self.rend.pack["__pillar__"].clear()
+                        self.rend.pack["__pillar__"].update(self.pillar_data)
+                    else:
+                        self.rend.pack["__pillar__"] = self.pillar_data
+            else:
+                self.rend.pack["__pillar__"] = self.pillar_data
 
     def decrypt_pillar(self, pillar):
         """
@@ -1306,7 +1406,7 @@ class PillarCache(Pillar):
 
     def clear_pillar(self):
         """
-        Clea the pillar cache, if it exists
+        Clear the pillar cache, if it exists
         """
         return self.cache.flush("pillar", self.pillar_key)
 

@@ -4,7 +4,7 @@ URL utils
 
 import re
 import sys
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urlunsplit
 
 import salt.utils.data
 import salt.utils.path
@@ -44,10 +44,8 @@ def create(path, saltenv=None):
     if salt.utils.platform.is_windows():
         path = salt.utils.path.sanitize_win_path(path)
     path = salt.utils.data.decode(path)
-
     query = f"saltenv={saltenv}" if saltenv else ""
-    url = salt.utils.data.decode(urlunparse(("file", "", path, "", query, "")))
-    return "salt://{}".format(url[len("file:///") :])
+    return f'salt://{salt.utils.data.decode(urlunsplit(("", "", path, query, "")))}'
 
 
 def is_escaped(url):

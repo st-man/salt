@@ -1,4 +1,5 @@
 import atexit
+import configparser
 import contextlib
 import logging
 import os
@@ -38,6 +39,144 @@ from tests.support.pytest.helpers import TestAccount, download_file
 ARTIFACTS_DIR = CODE_DIR / "artifacts" / "pkg"
 
 log = logging.getLogger(__name__)
+
+
+def _macos_salt_exe_command_v(path_prefix: str):
+    """
+    Resolve ``salt`` using only *path_prefix* in ``PATH`` (bash ``command -v``).
+
+    ``shutil.which`` can still pick a stale or unrelated ``salt`` when the
+    process ``PATH`` is polluted; an isolated lookup matches CI runners more
+    reliably after ``installer`` drops files under ``/opt``.
+    """
+    try:
+        env = os.environ.copy()
+        env["PATH"] = path_prefix
+        proc = subprocess.run(
+            ["/bin/bash", "-lc", "command -v salt"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    return lines[0]
+
+
+def _macos_prefix_from_salt_exe(salt_exe: str):
+    if not salt_exe:
+        return None
+    try:
+        wp = pathlib.Path(salt_exe).resolve()
+    except OSError:
+        return None
+    if "saltstack" not in str(wp) and "/opt/salt" not in str(wp):
+        return None
+    if wp.parent.name == "bin":
+        return wp.parent.parent
+    return wp.parent
+
+
+def _macos_salt_onedir_prefix():
+    """
+    Return the on-disk Salt onedir prefix on macOS, if installed.
+
+    Newer macOS packages install under ``/opt/saltstack/salt`` (same layout as
+    Linux onedir). Older releases used ``/opt/salt``. Use ``exists()`` so
+    symlinks and executable wrappers are detected the same way as in CI.
+    If layout probes miss (e.g. before ``PATH`` is updated), fall back to
+    ``shutil.which`` with common install locations prepended.
+    """
+    for candidate in (
+        pathlib.Path("/opt/saltstack/salt"),
+        pathlib.Path("/opt/salt"),
+    ):
+        if (candidate / "bin" / "salt").exists():
+            return candidate
+        if (candidate / "salt").exists():
+            return candidate
+    mac_bins = "/opt/saltstack/salt/bin:/opt/salt/bin:/opt/saltstack/salt:/opt/salt"
+    path_for_which = mac_bins + os.pathsep + os.environ.get("PATH", "")
+    prefix = _macos_prefix_from_salt_exe(shutil.which("salt", path=path_for_which))
+    if prefix is not None:
+        return prefix
+    return _macos_prefix_from_salt_exe(_macos_salt_exe_command_v(mac_bins))
+
+
+def pep440_public_equal(reported: str, expected: str) -> bool:
+    """
+    True when *reported* and *expected* match on release/pre/post/dev, ignoring
+    local when one side omits it (``salt --version`` often drops ``+g``).
+    """
+    try:
+        pr = packaging.version.parse(reported)
+        pe = packaging.version.parse(expected)
+    except packaging.version.InvalidVersion:
+        return reported == expected
+
+    def _pub(v):
+        return (v.release, v.pre, v.post, v.dev)
+
+    return _pub(pr) == _pub(pe)
+
+
+def pep440_version_to_rpm_nevra_version(version: str) -> str:
+    """
+    Map a PEP440-style version string to the RPM ``Version`` field spelling.
+
+    Published RPMs use a tilde before pre-release labels (``3008.0~rc1``) while
+    CI and pytest often pass ``3008.0rc1``. :command:`yum` / :command:`tdnf`
+    then cannot resolve ``salt-3008.0rc1``.
+
+    If *version* already contains ``~`` (RPM-shaped), it is returned unchanged.
+    Non-pre-release versions are returned unchanged.
+    """
+    if not version or "~" in version:
+        return version
+    try:
+        parsed = packaging.version.parse(version)
+    except packaging.version.InvalidVersion:
+        return version
+    if parsed.pre is None and parsed.dev is None:
+        return version
+    release = ".".join(str(p) for p in parsed.release)
+    out = release
+    if parsed.pre is not None:
+        pre_l, pre_n = parsed.pre
+        out = f"{out}~{pre_l}{pre_n}"
+    else:
+        out = f"{out}~dev{parsed.dev}"
+    if parsed.post is not None:
+        out = f"{out}.post{parsed.post}"
+    if parsed.local is not None:
+        out = f"{out}+{parsed.local}"
+    return out
+
+
+import pytestshellutils.shell
+import pytestshellutils.utils.processes
+
+_original_terminate = pytestshellutils.shell.SubprocessImpl._terminate
+
+
+def _patched_terminate(self):
+    if not platform.is_darwin():
+        return _original_terminate(self)
+
+    from tests.support.mock import patch
+
+    with patch("psutil.Process.children", return_value=[]):
+        return _original_terminate(self)
+
+
+pytestshellutils.shell.SubprocessImpl._terminate = _patched_terminate
 
 
 @attr.s(kw_only=True, slots=True)
@@ -85,6 +224,7 @@ class SaltPkgInstall:
     file_ext: bool = attr.ib(default=None)
     relenv: bool = attr.ib(default=True)
     installer_timeout: int = attr.ib(default=attr.NOTHING)
+    install_env: dict = attr.ib(factory=dict)
 
     @proc.default
     def _default_proc(self):
@@ -201,7 +341,8 @@ class SaltPkgInstall:
                 os.getenv("ProgramFiles"), "Salt Project", "Salt"
             ).resolve()
         elif platform.is_darwin():
-            install_dir = pathlib.Path("/opt", "salt")
+            found = _macos_salt_onedir_prefix()
+            install_dir = found if found is not None else pathlib.Path("/opt", "salt")
         else:
             install_dir = pathlib.Path("/opt", "saltstack", "salt")
         return install_dir
@@ -225,9 +366,19 @@ class SaltPkgInstall:
         if not self.upgrade and not self.use_prev_version:
             version = self.artifact_version
         else:
-            version = self.prev_version
-            parsed = packaging.version.parse(version)
-            version = f"{parsed.major}.{parsed.minor}"
+            if self.prev_version is None:
+                raise ValueError(
+                    "prev_version must be provided for upgrade tests. "
+                    "Use --prev-version option to specify the previous version."
+                )
+            if self.use_prev_version:
+                # Post-downgrade integration: ``salt --version`` reports the full
+                # previous release (e.g. 3008.0rc1), not ``major.minor`` only.
+                version = self.prev_version
+            else:
+                version = self.prev_version
+                parsed = packaging.version.parse(version)
+                version = f"{parsed.major}.{parsed.minor}"
         # ensure services stopped on Debian/Ubuntu (minic install for RedHat - non-starting)
         if self.distro_id in ("ubuntu", "debian"):
             self.stop_services()
@@ -259,7 +410,18 @@ class SaltPkgInstall:
     def update_process_path(self):
         # The installer updates the path for the system, but that doesn't
         # make it to this python session, so we need to update that
-        os.environ["PATH"] = ";".join([str(self.install_dir), os.getenv("path")])
+        if platform.is_windows():
+            os.environ["PATH"] = ";".join([str(self.install_dir), os.getenv("path")])
+        elif platform.is_darwin():
+            # On macOS, salt executables are in install_dir (/opt/salt)
+            # while Python executables are in bin_dir (/opt/salt/bin)
+            path_parts = [str(self.install_dir), str(self.bin_dir), os.getenv("PATH")]
+            os.environ["PATH"] = ":".join(path_parts)
+        else:
+            os.environ["PATH"] = ":".join([str(self.bin_dir), os.getenv("PATH")])
+        # Update the proc's captured environment so run() calls pick up the new PATH
+        if self.proc is not None:
+            self.proc.environ["PATH"] = os.environ["PATH"]
 
     def __attrs_post_init__(self):
         self.relenv = packaging.version.parse(self.version) >= packaging.version.parse(
@@ -307,7 +469,7 @@ class SaltPkgInstall:
                 elif platform.is_darwin():
                     self.root = pathlib.Path("/opt")
                     if self.file_ext == "pkg":
-                        self.bin_dir = self.root / "salt" / "bin"
+                        self.bin_dir = self.install_dir / "bin"
                         self.run_root = self.bin_dir / "run"
                     else:
                         log.error("Unexpected file extension: %s", self.file_ext)
@@ -424,6 +586,108 @@ class SaltPkgInstall:
         log.debug("binary_paths: %s", self.binary_paths)
         log.debug("install_dir: %s", self.install_dir)
 
+    def _refresh_macos_binary_paths(self):
+        """
+        Re-resolve ``install_dir`` / ``binary_paths`` after a ``.pkg`` install.
+
+        ``__attrs_post_init__`` runs before installers populate ``/opt/...``,
+        so upgrade/downgrade sessions need a second pass once files exist.
+        """
+        if not platform.is_darwin():
+            return
+        # Prepends so :func:`shutil.which` inside prefix detection can see
+        # ``/opt`` layouts before a stale default ``/opt/salt`` mis-seeds
+        # ``$PATH`` from :meth:`update_process_path`.
+        opt_first = [
+            p
+            for p in (
+                "/opt/saltstack/salt/bin",
+                "/opt/saltstack/salt",
+                "/opt/salt/bin",
+                "/opt/salt",
+            )
+            if pathlib.Path(p).exists()
+        ]
+        _old = os.environ.get("PATH", "")
+        if opt_first:
+            os.environ["PATH"] = os.pathsep.join(opt_first) + os.pathsep + _old
+        try:
+            found = _macos_salt_onedir_prefix()
+        finally:
+            os.environ["PATH"] = _old
+        if found is None:
+            return
+        self.install_dir = found
+        self.bin_dir = found / "bin"
+        self.run_root = self.bin_dir / "run"
+        python_bin = self.install_dir / "bin" / "python3"
+        if os.path.exists(self.install_dir / "bin" / "salt"):
+            install_dir = self.install_dir / "bin"
+        else:
+            install_dir = self.install_dir
+        if self.relenv:
+            self.binary_paths = {
+                "salt": [install_dir / "salt"],
+                "api": [install_dir / "salt-api"],
+                "call": [install_dir / "salt-call"],
+                "cloud": [install_dir / "salt-cloud"],
+                "cp": [install_dir / "salt-cp"],
+                "key": [install_dir / "salt-key"],
+                "master": [install_dir / "salt-master"],
+                "minion": [install_dir / "salt-minion"],
+                "proxy": [install_dir / "salt-proxy"],
+                "run": [install_dir / "salt-run"],
+                "ssh": [install_dir / "salt-ssh"],
+                "syndic": [install_dir / "salt-syndic"],
+                "spm": [install_dir / "spm"],
+                "pip": [install_dir / "salt-pip"],
+                "python": [python_bin],
+            }
+        else:
+            self.binary_paths = {
+                "salt": [shutil.which("salt")],
+                "api": [shutil.which("salt-api")],
+                "call": [shutil.which("salt-call")],
+                "cloud": [shutil.which("salt-cloud")],
+                "cp": [shutil.which("salt-cp")],
+                "key": [shutil.which("salt-key")],
+                "master": [shutil.which("salt-master")],
+                "minion": [shutil.which("salt-minion")],
+                "proxy": [shutil.which("salt-proxy")],
+                "run": [shutil.which("salt-run")],
+                "ssh": [shutil.which("salt-ssh")],
+                "syndic": [shutil.which("salt-syndic")],
+                "spm": [shutil.which("spm")],
+                "python": [str(pathlib.Path("/usr/bin/python3"))],
+            }
+            if self.classic:
+                self.binary_paths = {
+                    "salt": [self.bin_dir / "salt"],
+                    "api": [self.bin_dir / "salt-api"],
+                    "call": [self.bin_dir / "salt-call"],
+                    "cloud": [self.bin_dir / "salt-cloud"],
+                    "cp": [self.bin_dir / "salt-cp"],
+                    "key": [self.bin_dir / "salt-key"],
+                    "master": [self.bin_dir / "salt-master"],
+                    "minion": [self.bin_dir / "salt-minion"],
+                    "proxy": [self.bin_dir / "salt-proxy"],
+                    "run": [self.bin_dir / "salt-run"],
+                    "ssh": [self.bin_dir / "salt-ssh"],
+                    "syndic": [self.bin_dir / "salt-syndic"],
+                    "spm": [self.bin_dir / "spm"],
+                    "python": [str(self.bin_dir / "python3")],
+                    "pip": [str(self.bin_dir / "pip3")],
+                }
+            else:
+                self.binary_paths["python"] = [shutil.which("salt"), "shell"]
+                self.binary_paths["pip"] = [self.run_root, "pip"]
+                self.binary_paths["spm"] = [shutil.which("salt-spm")]
+        log.debug(
+            "Refreshed macOS binary_paths (install_dir=%s): %s",
+            self.install_dir,
+            self.binary_paths,
+        )
+
     @staticmethod
     def salt_factories_root_dir(system_service: bool = False) -> pathlib.Path:
         if system_service is False:
@@ -431,7 +695,8 @@ class SaltPkgInstall:
         if platform.is_windows():
             return pathlib.Path("C:\\salt")
         if platform.is_darwin():
-            return pathlib.Path("/opt/salt")
+            found = _macos_salt_onedir_prefix()
+            return found if found is not None else pathlib.Path("/opt/salt")
         return pathlib.Path("/")
 
     def _check_retcode(self, ret):
@@ -455,18 +720,22 @@ class SaltPkgInstall:
         if downgrade:
             self.install_previous(downgrade=downgrade)
             return True
-        pkg = str(pathlib.Path(self.pkgs[0]).resolve())
+        pkg = None
+        if platform.is_windows() and self.file_ext:
+            for p in self.pkgs:
+                if p.endswith(self.file_ext):
+                    pkg = str(pathlib.Path(p).resolve())
+                    break
+        if pkg is None:
+            pkg = str(pathlib.Path(self.pkgs[0]).resolve())
         if platform.is_windows():
             if upgrade:
                 self.root = self.install_dir.parent
                 self.bin_dir = self.install_dir
                 self.ssm_bin = self.install_dir / "ssm.exe"
                 self._ensure_windows_services_stopped()
-                # Add a small delay after stopping services to ensure all file handles
-                # are released and processes are fully terminated before running installer
                 time.sleep(3)
             if pkg.endswith("exe"):
-                # Install the package
                 log.info("Installing: %s", str(pkg))
                 ret = self.proc.run(
                     str(pkg),
@@ -476,35 +745,55 @@ class SaltPkgInstall:
                 )
                 self._check_retcode(ret)
             elif pkg.endswith("msi"):
-                # Install the package
                 log.info("Installing: %s", str(pkg))
                 # self.proc.run always makes the command a list even when shell
                 # is true, meaning shell being true will never work correctly.
+                msi_cmd = f'msiexec.exe /qn /i "{pkg}" /norestart START_MINION=""'
                 ret = subprocess.run(
-                    f'msiexec.exe /qn /i {pkg} /norestart START_MINION=""',
+                    msi_cmd,
                     shell=True,  # nosec
                     check=False,
                 )
+                log.info("MSI returncode: %s", ret.returncode)
                 assert ret.returncode in [0, 3010]
+
+                if upgrade:
+                    # MSI major upgrades with mismatched component GUIDs can
+                    # remove files that should be kept. Running a repair
+                    # ensures all files from the new product are on disk.
+                    repair_cmd = f'msiexec.exe /qn /fa "{pkg}" /norestart'
+                    repair_ret = subprocess.run(
+                        repair_cmd,
+                        shell=True,  # nosec
+                        check=False,
+                    )
+                    log.info("MSI repair returncode: %s", repair_ret.returncode)
             else:
                 log.error("Invalid package: %s", pkg)
                 return False
 
-            # XXX This should be temporary. See also a similar thing happening
-            # in tests/pytests/pkg/conftest.py
-            grainsdir = pathlib.Path(
-                r"C:\Program Files\Salt Project\Salt\Lib\site-packages\salt\grains"
-            )
-            shutil.copy(r"salt\grains\disks.py", grainsdir)
-
-            # Remove the service installed by the installer
             log.debug("Removing installed salt-minion service")
-            self.proc.run(str(self.ssm_bin), "remove", "salt-minion", "confirm")
+            self.proc.run(str(self.ssm_bin), "stop", "salt-minion", "confirm")
+            subprocess.run(
+                "sc.exe delete salt-minion",
+                shell=True,  # nosec
+                check=False,
+            )
+            # Wait for Windows to fully purge the service entry
+            for _ in range(30):
+                ret = subprocess.run(
+                    "sc.exe query salt-minion",
+                    shell=True,  # nosec
+                    check=False,
+                    capture_output=True,
+                )
+                if ret.returncode != 0:
+                    break
+                time.sleep(1)
 
             # Add installation to the path
             self.update_process_path()
 
-            # Install the service using our config
             if self.pkg_system_service:
                 self._install_ssm_service()
 
@@ -517,8 +806,22 @@ class SaltPkgInstall:
             self._check_retcode(ret)
 
             # Stop the service installed by the installer
-            self.proc.run("launchctl", "disable", f"system/{service_name}")
-            self.proc.run("launchctl", "bootout", "system", str(plist_file))
+
+            try:
+                subprocess.run(
+                    ["launchctl", "disable", f"system/{service_name}"],
+                    check=False,
+                    timeout=30,
+                )
+                subprocess.run(
+                    ["launchctl", "bootout", "system", str(plist_file)],
+                    check=False,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                log.warning("launchctl command timed out")
+
+            self._refresh_macos_binary_paths()
 
         elif upgrade:
             env = os.environ.copy()
@@ -529,7 +832,10 @@ class SaltPkgInstall:
                     "/etc", "apt", "preferences.d", "salt-pin-1001"
                 )
                 pref_file.parent.mkdir(exist_ok=True)
-                pin = f"{self.artifact_version.rsplit('.', 1)[0]}.*"
+                deb_artifact = pep440_version_to_rpm_nevra_version(
+                    self.artifact_version
+                )
+                pin = f"{deb_artifact.rsplit('.', 1)[0]}.*"
                 with salt.utils.files.fopen(pref_file, "w") as fp:
                     fp.write(
                         f"Package: salt-*\n"
@@ -544,6 +850,9 @@ class SaltPkgInstall:
                     "DPkg::Options::=--force-confdef",
                     "-o",
                     "DPkg::Options::=--force-confold",
+                    # Downgrade leaves (e.g.) ``salt-dbg`` newer than pinned mains until
+                    # the next full install; ``apt upgrade`` needs this on Debian/Ubuntu.
+                    "--allow-downgrades",
                 ]
             log.info("Installing packages:\n%s", pprint.pformat(self.pkgs))
             args = extra_args + self.pkgs
@@ -563,6 +872,12 @@ class SaltPkgInstall:
                 env=env,
             )
         else:
+            # Fresh install path
+            env = os.environ.copy()
+            # Add any custom install environment variables
+            if self.install_env:
+                env.update(self.install_env)
+
             args = ["install", "-y"]
             if self.distro_id == "photon":
                 ret = self.proc.run(
@@ -576,7 +891,7 @@ class SaltPkgInstall:
                     args.append("--nogpgcheck")
             log.info("Installing packages:\n%s", pprint.pformat(self.pkgs))
             args += self.pkgs
-            ret = self.proc.run(self.pkg_mngr, *args)
+            ret = self.proc.run(self.pkg_mngr, *args, env=env)
 
         if not platform.is_darwin() and not platform.is_windows():
             # Make sure we don't have any trailing references to old package file locations
@@ -598,39 +913,29 @@ class SaltPkgInstall:
             log.debug("Windows SSM binary not found at %s", self.ssm_bin)
             return
 
-        for service in ("salt-minion", "salt-master", "salt-syndic"):
-            stop = self.proc.run(
-                str(self.ssm_bin), "stop", service, "confirm", _timeout=120
+        stop = self.proc.run(
+            str(self.ssm_bin), "stop", "salt-minion", "confirm", _timeout=120
+        )
+        # 1062: The service has not been started.
+        if stop.returncode not in (0, 1062):
+            log.debug(
+                "Stopping service salt-minion returned %s",
+                stop.returncode,
             )
-            # 1062: The service has not been started.
-            if stop.returncode not in (0, 1062):
-                log.debug(
-                    "Stopping service %s returned %s",
-                    service,
-                    stop.returncode,
-                )
 
         deadline = time.time() + 120
-        running = set()
-        tracked = {name.lower() for name in ("salt-minion.exe", "salt-master.exe")}
         while time.time() < deadline:
             running = {
                 (proc.info["name"] or "").lower()
                 for proc in psutil.process_iter(["name"])
-                if (proc.info["name"] or "").lower() in tracked
+                if (proc.info["name"] or "").lower() == "salt-minion.exe"
             }
             if not running:
                 break
-            log.debug(
-                "Waiting for Salt processes to exit before upgrade: %s",
-                sorted(running),
-            )
+            log.debug("Waiting for salt-minion process to exit before upgrade")
             time.sleep(2)
         else:
-            log.warning(
-                "Salt processes still running before upgrade: %s",
-                sorted(running),
-            )
+            log.warning("salt-minion process still running before upgrade")
 
     def _install_ssm_service(self, service="minion"):
         """
@@ -689,8 +994,65 @@ class SaltPkgInstall:
 
     def install(self, upgrade=False, downgrade=False, stop_services=True):
         self._install_pkgs(upgrade=upgrade, downgrade=downgrade)
+        if platform.is_darwin():
+            self._refresh_macos_binary_paths()
+            self.update_process_path()
+            if stop_services:
+                # The Salt .pkg loads ``com.saltstack.salt.minion`` (and on
+                # some installs also ``master``/``api``/``syndic``) at install
+                # time via ``RunAtLoad=true``. Those daemons start with the
+                # default minion config (``master: salt``, which does not
+                # resolve), so they never authenticate to the test fixture's
+                # master. Worse, saltfactories' ``PkgLaunchdSaltDaemonImpl``
+                # checks the plist label when its own ``salt_minion`` fixture
+                # tries to ``launchctl bootstrap`` -- sees the auto-loaded
+                # daemon, declares the test minion "already running", and
+                # silently uses the misconfigured launchd-managed process
+                # instead. Fan-out then finds zero connected minions and
+                # ``api_request`` returns ``{'return': [{}]}``.
+                # Bootout the auto-installed daemons here so the label is
+                # free when the test fixture brings up its own.
+                self._stop_macos_pkg_daemons()
         if self.distro_id in ("ubuntu", "debian") and stop_services:
             self.stop_services()
+        elif (
+            upgrade
+            and self.pkg_system_service
+            and not platform.is_windows()
+            and not platform.is_darwin()
+        ):
+            # RPM/DEB upgrade replaces on disk while systemd units can keep old
+            # processes until restart; ``salt-call --local test.version`` then
+            # still reports the previous release (see upgrade systemd teardown).
+            self.restart_services()
+
+    def _stop_macos_pkg_daemons(self):
+        """
+        Bootout each ``com.saltstack.salt.*`` plist the .pkg installed so the
+        labels are free for the test fixtures to load their own configurations.
+        Idempotent: ``launchctl bootout`` on a not-loaded service exits with a
+        non-zero status which we deliberately ignore. Also re-enables the
+        service after bootout so a previous test run that left it disabled
+        (via ``launchctl disable`` in fixture teardown) does not block the
+        next ``launchctl bootstrap`` -- ``disable`` persists on disk in
+        ``/var/db/com.apple.xpc.launchd/disabled.plist`` across reboots.
+        """
+        plist_dir = pathlib.Path("/Library/LaunchDaemons")
+        for service in ("salt-master", "salt-minion", "salt-api", "salt-syndic"):
+            label = f"com.saltstack.{service.replace('-', '.')}"
+            plist = plist_dir / f"{label}.plist"
+            if not plist.exists():
+                continue
+            for cmd in (
+                ("launchctl", "bootout", "system", str(plist)),
+                ("launchctl", "enable", f"system/{label}"),
+            ):
+                try:
+                    subprocess.run(
+                        ["sudo", *cmd], check=False, capture_output=True, timeout=30
+                    )
+                except subprocess.TimeoutExpired:
+                    log.warning("launchctl %s timed out for %s", cmd[1], service)
 
     def stop_services(self):
         """
@@ -727,6 +1089,40 @@ class SaltPkgInstall:
             )
             restart_service = self.proc.run("systemctl", "restart", service)
             self._check_retcode(restart_service)
+
+    def _salt_yum_repo_path(self) -> pathlib.Path:
+        """
+        Path to the Broadcom ``salt.repo`` copy under ``/etc/yum.repos.d`` (see
+        :meth:`install_previous`).
+        """
+        distro_name = self.distro_name
+        if distro_name in ("almalinux", "rocky", "centos", "fedora"):
+            distro_name = "redhat"
+        return pathlib.Path("/etc/yum.repos.d") / f"salt-{distro_name}.repo"
+
+    def _rpm_repo_set_enabled_photon(self, repo_id: str, enabled: bool) -> None:
+        """
+        PhotonOS uses ``tdnf`` behind ``yum``; it does not implement
+        ``dnf config-manager --enable``. Toggle ``enabled=`` in the repo file and
+        refresh metadata.
+        """
+        repo_path = self._salt_yum_repo_path()
+        parser = configparser.ConfigParser(interpolation=None)
+        if not parser.read(repo_path, encoding="utf-8"):
+            log.error("Could not read Salt repo file at %s", repo_path)
+            assert False, f"Missing or unreadable repo file: {repo_path}"
+        if not parser.has_section(repo_id):
+            log.error(
+                "Salt repo file %s has no [%s] stanza (upstream salt.repo changed?)",
+                repo_path,
+                repo_id,
+            )
+            assert False, f"Repo file {repo_path} missing [{repo_id}]"
+        parser.set(repo_id, "enabled", "1" if enabled else "0")
+        with salt.utils.files.fopen(repo_path, "w", encoding="utf-8") as fp:
+            parser.write(fp)
+        ret = self.proc.run(self.pkg_mngr, "makecache", "-y")
+        self._check_retcode(ret)
 
     def install_previous(self, downgrade=False):
         """
@@ -779,12 +1175,15 @@ class SaltPkgInstall:
             pkgs_to_install = self.salt_pkgs.copy()
 
             if self.distro_name == "photon":
+                rpm_prev = pep440_version_to_rpm_nevra_version(self.prev_version)
                 orig_pkgs = pkgs_to_install[:]
                 pkgs_to_install = []
                 for _ in orig_pkgs:
-                    pkgs_to_install.append(f"{_}-{self.prev_version}")
+                    pkgs_to_install.append(f"{_}-{rpm_prev}")
                 ret = self.proc.run(self.pkg_mngr, "clean", "all")
                 self._check_retcode(ret)
+                if major_ver >= 3008:
+                    self._rpm_repo_set_enabled_photon("salt-repo-latest", True)
             else:
                 if "3007" in self.prev_version:
                     ret = self.proc.run(
@@ -792,6 +1191,17 @@ class SaltPkgInstall:
                         "config-manager",
                         "--enable",
                         "salt-repo-3007-sts",
+                    )
+                    self._check_retcode(ret)
+                elif major_ver >= 3008:
+                    # Default ``salt.repo`` enables v3006 LTS only; that stanza excludes
+                    # ``*3008*``. Published 3008.x RPMs (including pre-releases) are only
+                    # visible when ``salt-repo-latest`` is enabled.
+                    ret = self.proc.run(
+                        self.pkg_mngr,
+                        "config-manager",
+                        "--enable",
+                        "salt-repo-latest",
                     )
                     self._check_retcode(ret)
                 else:
@@ -804,6 +1214,16 @@ class SaltPkgInstall:
                     self._check_retcode(ret)
                 ret = self.proc.run(self.pkg_mngr, "clean", "expire-cache")
                 self._check_retcode(ret)
+                # Unversioned ``yum downgrade`` only moves one step among *all* repo
+                # versions, so a downgrade from a 3008 pre-release artifact can jump to
+                # 3006.x if the exact ``--prev-version`` build is not selected. Pin the
+                # RPM set like Photon already does (release suffix is distro-specific).
+                if downgrade:
+                    rpm_prev = pep440_version_to_rpm_nevra_version(self.prev_version)
+                    orig_pkgs = pkgs_to_install[:]
+                    if self.dbg_pkg:
+                        orig_pkgs = [p for p in orig_pkgs if self.dbg_pkg not in p]
+                    pkgs_to_install = [f"{pkg}-{rpm_prev}-*" for pkg in orig_pkgs]
 
             if self.distro_version == "8" and self.classic:
                 # centosstream 8 doesn't downgrade properly using the downgrade command for some reason
@@ -828,7 +1248,6 @@ class SaltPkgInstall:
                 *pkgs_to_install,
                 "-y",
             )
-            log.error("**WTF %r", ret)
             self._check_retcode(ret)
 
         elif distro_name in ["debian", "ubuntu"]:
@@ -862,15 +1281,36 @@ class SaltPkgInstall:
             self._check_retcode(ret)
             pref_file = pathlib.Path("/etc", "apt", "preferences.d", "salt-pin-1001")
             pref_file.parent.mkdir(exist_ok=True)
-            pin = f"{self.prev_version.rsplit('.', 1)[0]}.*"
-            if downgrade:
+            deb_upstream = pep440_version_to_rpm_nevra_version(self.prev_version)
+            # Only use the explicit ``pkg=…`` path when Debian's version spelling
+            # differs from *prev_version* (e.g. ``3008.0rc1`` vs ``3008.0~rc1``).
+            # For normal releases (``3007.14``), ``deb_upstream == prev_version``;
+            # reusing this branch would skip ``salt-dbg`` and leave it newer than the
+            # pin, so a later ``apt upgrade`` fails without ``--allow-downgrades``.
+            if downgrade and relenv and deb_upstream != self.prev_version:
+                # ``Pin: version 3008.0rc1`` does not match published Debian versions
+                # spelled ``3008.0~rc1``.  Unversioned ``apt-get install salt-*`` then
+                # leaves a locally installed nightly (``3008.0~rc1+185…``) untouched, so
+                # ``salt --version`` never drops below the CI artifact (downgrade test
+                # asserts ``downgraded < artifact_ver``).
+                #
+                # Do **not** use ``pkg=3008.0~rc1*``: the glob matches the already-installed
+                # ``3008.0~rc1+185…`` builds (they sort higher), so apt keeps the artifact.
+                # Pin and install the exact Broadcom repo upstream version (see
+                # ``apt-cache show salt-common | ^Version:``), same as ``apt-cache madison``.
+                pin = deb_upstream
+                install_targets = []
+                for name in self.salt_pkgs:
+                    if self.dbg_pkg and name == self.dbg_pkg:
+                        continue
+                    install_targets.append(f"{name}={deb_upstream}")
+                cmd = [self.pkg_mngr, "install", *install_targets, "-y"]
+            else:
                 pin = self.prev_version
-            with salt.utils.files.fopen(pref_file, "w") as fp:
-                fp.write(
-                    f"Package: salt-*\n" f"Pin: version {pin}\n" f"Pin-Priority: 1001"
-                )
+                cmd = [self.pkg_mngr, "install", *self.salt_pkgs, "-y"]
 
-            cmd = [self.pkg_mngr, "install", *self.salt_pkgs, "-y"]
+            with salt.utils.files.fopen(pref_file, "w") as fp:
+                fp.write(f"Package: salt-*\nPin: version {pin}\nPin-Priority: 1001\n")
 
             # if downgrade:
             #    pref_file = pathlib.Path("/etc", "apt", "preferences.d", "salt-pin-1001")
@@ -921,6 +1361,7 @@ class SaltPkgInstall:
             self.ssm_bin = self.install_dir / "ssm.exe"
             pkg = str(pathlib.Path(self.pkgs[0]).resolve())
 
+            win_pkg = None
             if self.file_ext == "exe":
                 win_pkg = (
                     f"Salt-Minion-{self.prev_version}-Py3-AMD64-Setup.{self.file_ext}"
@@ -958,15 +1399,14 @@ class SaltPkgInstall:
                 )
                 assert ret.returncode in [0, 3010]
             else:
-                ret = self.proc.run(str(pkg_path), "/start-minion=0", "/S", timeout=600)
+                # ret = self.proc.run("start", "/wait", f"\"{pkg_path} /start-minion=0 /S\"")
+                batch_file = pkg_path.parent / "install_nsis.cmd"
+                batch_content = f"start /wait {str(pkg_path)} /start-minion=0 /S"
+                with salt.utils.files.fopen(batch_file, "w") as fp:
+                    fp.write(batch_content)
+                # Now run the batch file
+                ret = self.proc.run("cmd.exe", "/c", str(batch_file), _timeout=900)
                 self._check_retcode(ret)
-
-            # XXX This should be temporary. See also a similar thing happening
-            # in tests/pytests/pkg/conftest.py
-            grainsdir = pathlib.Path(
-                r"C:\Program Files\Salt Project\Salt\Lib\site-packages\salt\grains"
-            )
-            shutil.copy(r"salt\grains\disks.py", grainsdir)
 
             log.debug("Removing installed salt-minion service")
             ret = self.proc.run(str(self.ssm_bin), "remove", "salt-minion", "confirm")
@@ -1000,9 +1440,35 @@ class SaltPkgInstall:
 
             ret = self.proc.run("installer", "-pkg", mac_pkg_path, "-target", "/")
             self._check_retcode(ret)
+            self._refresh_macos_binary_paths()
+
+            # Stop services started by the old installer so the test framework
+            # can bootstrap them with the correct test configuration on start.
+            daemons_dir = pathlib.Path("/Library", "LaunchDaemons")
+            for svc in ("minion", "master", "api", "syndic"):
+                svc_name = f"com.saltstack.salt.{svc}"
+                plist_file = daemons_dir / f"{svc_name}.plist"
+                try:
+                    subprocess.run(
+                        ["launchctl", "disable", f"system/{svc_name}"],
+                        check=False,
+                        timeout=30,
+                    )
+                    subprocess.run(
+                        ["launchctl", "bootout", "system", str(plist_file)],
+                        check=False,
+                        timeout=30,
+                    )
+                except subprocess.TimeoutExpired:
+                    log.warning("launchctl timed out stopping %s", svc_name)
 
     def uninstall(self):
         pkg = self.pkgs[0]
+        if platform.is_windows() and self.file_ext:
+            for p in self.pkgs:
+                if p.endswith(self.file_ext):
+                    pkg = p
+                    break
         if platform.is_windows():
             log.info("Uninstalling %s", pkg)
             if pkg.endswith("exe"):
@@ -1020,32 +1486,30 @@ class SaltPkgInstall:
                 service_name = f"com.saltstack.salt.{service}"
                 plist_file = daemons_dir / f"{service_name}.plist"
                 # Stop the services
-                self.proc.run("launchctl", "disable", f"system/{service_name}")
-                self.proc.run("launchctl", "bootout", "system", str(plist_file))
+
+                try:
+                    subprocess.run(
+                        ["launchctl", "disable", f"system/{service_name}"],
+                        check=False,
+                        timeout=30,
+                    )
+                    subprocess.run(
+                        ["launchctl", "bootout", "system", str(plist_file)],
+                        check=False,
+                        timeout=30,
+                    )
+                except subprocess.TimeoutExpired:
+                    log.warning("launchctl command timed out")
 
             # Remove Symlink to salt-config
             if os.path.exists("/usr/local/sbin/salt-config"):
                 os.unlink("/usr/local/sbin/salt-config")
 
             # Remove supporting files
+            # Use shell=True for piped commands
             self.proc.run(
-                "pkgutil",
-                "--only-files",
-                "--files",
-                "com.saltstack.salt",
-                "|",
-                "grep",
-                "-v",
-                "opt",
-                "|",
-                "tr",
-                "'\n'",
-                "' '",
-                "|",
-                "xargs",
-                "-0",
-                "rm",
-                "-f",
+                "pkgutil --only-files --files com.saltstack.salt | grep -v opt | sed 's|^|/|' | tr '\\n' '\\0' | xargs -0 rm -f",
+                shell=True,
             )
 
             # Remove directories
@@ -1059,8 +1523,9 @@ class SaltPkgInstall:
             # Remove receipt
             self.proc.run("pkgutil", "--forget", "com.saltstack.salt")
 
-            log.debug("Deleting the onedir directory: %s", self.root / "salt")
-            shutil.rmtree(str(self.root / "salt"))
+            log.debug("Deleting the onedir directory: %s", self.install_dir)
+            if self.install_dir.exists():
+                shutil.rmtree(str(self.install_dir))
         else:
             log.debug("Un-Installing packages:\n%s", pprint.pformat(self.salt_pkgs))
             ret = self.proc.run(self.pkg_mngr, self.rm_pkg, "-y", *self.salt_pkgs)
@@ -1068,57 +1533,55 @@ class SaltPkgInstall:
 
     def write_launchd_conf(self, service):
         service_name = f"com.saltstack.salt.{service}"
-        ret = self.proc.run("launchctl", "list", service_name)
-        # 113 means it couldn't find a service with that name
-        if ret.returncode == 113:
-            daemons_dir = pathlib.Path("/Library", "LaunchDaemons")
-            plist_file = daemons_dir / f"{service_name}.plist"
-            # Make sure we're using this plist file
-            if plist_file.exists():
-                log.warning("Removing existing plist file for service: %s", service)
-                plist_file.unlink()
+        daemons_dir = pathlib.Path("/Library", "LaunchDaemons")
+        plist_file = daemons_dir / f"{service_name}.plist"
+        # Always overwrite the plist installed by the Salt package. The
+        # package plist launches the daemon with no -c flag (uses /etc/salt),
+        # but the test suite needs -c <conf_dir> so daemons use the test
+        # configuration.  This must run as root (the whole pkg test suite
+        # requires root on macOS via ``sudo -E nox``).
+        if plist_file.exists():
+            log.debug("Overwriting existing plist for service: %s", service)
+        else:
+            log.debug("Creating plist for service: %s", service)
 
-            log.debug("Creating plist file for service: %s", service)
-            contents = f"""\
-                <?xml version="1.0" encoding="UTF-8"?>
-                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                <plist version="1.0">
+        contents = f"""\
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+                <dict>
+                    <key>Label</key>
+                    <string>{service_name}</string>
+                    <key>RunAtLoad</key>
+                    <true/>
+                    <key>KeepAlive</key>
+                    <true/>
+                    <key>ProgramArguments</key>
+                    <array>"""
+        for part in self.binary_paths[service]:
+            contents += f"""\n                        <string>{part}</string>\n"""
+        contents += f"""\
+                        <string>-c</string>
+                        <string>{self.conf_dir}</string>
+                    </array>
+                    <key>SoftResourceLimits</key>
                     <dict>
-                        <key>Label</key>
-                        <string>{service_name}</string>
-                        <key>RunAtLoad</key>
-                        <true/>
-                        <key>KeepAlive</key>
-                        <true/>
-                        <key>ProgramArguments</key>
-                        <array>"""
-            for part in self.binary_paths[service]:
-                contents += (
-                    f"""\n                            <string>{part}</string>\n"""
-                )
-            contents += f"""\
-                            <string>-c</string>
-                            <string>{self.conf_dir}</string>
-                        </array>
-                        <key>SoftResourceLimits</key>
-                        <dict>
-                            <key>NumberOfFiles</key>
-                            <integer>100000</integer>
-                        </dict>
-                        <key>HardResourceLimits</key>
-                        <dict>
-                            <key>NumberOfFiles</key>
-                            <integer>100000</integer>
-                        </dict>
+                        <key>NumberOfFiles</key>
+                        <integer>100000</integer>
                     </dict>
-                </plist>
-                """
-            plist_file.write_text(textwrap.dedent(contents), encoding="utf-8")
-            contents = plist_file.read_text()
-            log.debug("Created '%s'. Contents:\n%s", plist_file, contents)
+                    <key>HardResourceLimits</key>
+                    <dict>
+                        <key>NumberOfFiles</key>
+                        <integer>100000</integer>
+                    </dict>
+                </dict>
+            </plist>
+            """
+        plist_file.write_text(textwrap.dedent(contents), encoding="utf-8")
+        log.debug("Wrote '%s'. Contents:\n%s", plist_file, plist_file.read_text())
 
-            # Delete the plist file upon completion
-            atexit.register(plist_file.unlink)
+        # Remove the plist on exit so we don't leave test configuration behind.
+        atexit.register(plist_file.unlink)
 
     def write_systemd_conf(self, service, binary):
         ret = self.proc.run("systemctl", "daemon-reload")
@@ -1159,8 +1622,9 @@ class SaltPkgInstall:
             self._check_retcode(ret)
 
     def __enter__(self):
-        if platform.is_windows():
-            self.update_process_path()
+        self.update_process_path()
+        if platform.is_darwin():
+            self._refresh_macos_binary_paths()
 
         if self.no_install:
             return self
@@ -1178,18 +1642,57 @@ class SaltPkgInstall:
 
         # Did we left anything running?!
         procs = []
-        for proc in psutil.process_iter():
+        if not platform.is_windows():
+
             try:
-                name = proc.name()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-            if "salt" in name:
-                cmdl_strg = " ".join(str(element) for element in _get_cmdline(proc))
-                if "/opt/saltstack" in cmdl_strg:
-                    procs.append(proc)
+                output = subprocess.check_output(
+                    ["ps", "-eo", "pid,command"], text=True
+                )
+                for line in output.splitlines()[1:]:
+                    parts = line.strip().split(maxsplit=1)
+                    if len(parts) == 2:
+                        pid_str, cmdline = parts
+                        if "salt" in cmdline and (
+                            "/opt/saltstack" in cmdline or "/opt/salt" in cmdline
+                        ):
+                            try:
+                                pid = int(pid_str)
+                                if pid != os.getpid():
+                                    procs.append(psutil.Process(pid))
+                            except (ValueError, psutil.NoSuchProcess):
+                                pass
+            except subprocess.CalledProcessError:
+                pass
+        else:
+            for proc in psutil.process_iter():
+                try:
+                    name = proc.name()
+                    if "salt" in name or "python" in name:
+                        cmdl_strg = " ".join(
+                            str(element) for element in _get_cmdline(proc)
+                        )
+                        if "salt" in name or "salt" in cmdl_strg:
+                            if (
+                                "/opt/saltstack" in cmdl_strg
+                                or "/opt/salt" in cmdl_strg
+                            ):
+                                procs.append(proc)
+                except (
+                    psutil.NoSuchProcess,
+                    psutil.AccessDenied,
+                    psutil.ZombieProcess,
+                ):
+                    continue
 
         if procs:
-            terminate_process_list(procs, kill=True, slow_stop=True)
+            if platform.is_darwin():
+                for proc in procs:
+                    try:
+                        proc.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+            else:
+                terminate_process_list(procs, kill=True, slow_stop=True)
 
 
 class PkgSystemdSaltDaemonImpl(SystemdSaltDaemonImpl):
@@ -1235,11 +1738,13 @@ class PkgLaunchdSaltDaemonImpl(PkgSystemdSaltDaemonImpl):
                 args,
             )
         self._internal_run(
+            "sudo",
             "launchctl",
             "enable",
             f"system/{self.get_service_name()}",
         )
         return (
+            "sudo",
             "launchctl",
             "bootstrap",
             "system",
@@ -1251,7 +1756,10 @@ class PkgLaunchdSaltDaemonImpl(PkgSystemdSaltDaemonImpl):
         Returns true if the sub-process is alive.
         """
         if self._process is None:
-            ret = self._internal_run("launchctl", "list", self.get_service_name())
+            # System-domain launchd services require root to query on macOS 13+.
+            ret = self._internal_run(
+                "sudo", "launchctl", "list", self.get_service_name()
+            )
             if ret.stdout == "":
                 return False
 
@@ -1289,13 +1797,15 @@ class PkgLaunchdSaltDaemonImpl(PkgSystemdSaltDaemonImpl):
         atexit.unregister(self.terminate)
         log.info("Stopping %s", self.factory)
         pid = self.pid
-        # Collect any child processes information before terminating the process
+        # psutil.Process.children() can hang on macOS when the process is a
+        # launchd-managed daemon; skip child collection on Darwin.
         with contextlib.suppress(psutil.NoSuchProcess):
-            for child in psutil.Process(pid).children(recursive=True):
-                # pylint: disable=access-member-before-definition
-                if child not in self._children:
-                    self._children.append(child)
-                # pylint: enable=access-member-before-definition
+            if not platform.is_darwin():
+                for child in psutil.Process(pid).children(recursive=True):
+                    # pylint: disable=access-member-before-definition
+                    if child not in self._children:
+                        self._children.append(child)
+                    # pylint: enable=access-member-before-definition
 
         if self._process.is_running():  # pragma: no cover
             cmdline = _get_cmdline(self._process)
@@ -1303,30 +1813,41 @@ class PkgLaunchdSaltDaemonImpl(PkgSystemdSaltDaemonImpl):
             cmdline = []
 
         # Disable the service
-        self._internal_run(
-            "launchctl",
-            "disable",
-            f"system/{self.get_service_name()}",
-        )
-        # Unload the service
-        self._internal_run("launchctl", "bootout", "system", str(self.plist_file))
+
+        try:
+            subprocess.run(
+                ["launchctl", "disable", f"system/{self.get_service_name()}"],
+                check=False,
+                timeout=30,
+            )
+            # Unload the service
+            subprocess.run(
+                ["launchctl", "bootout", "system", str(self.plist_file)],
+                check=False,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("launchctl command timed out during terminate")
 
         if self._process.is_running():  # pragma: no cover
             try:
-                self._process.wait()
+                self._process.wait(10)
             except psutil.TimeoutExpired:
                 self._process.terminate()
                 try:
-                    self._process.wait()
+                    self._process.wait(10)
                 except psutil.TimeoutExpired:
                     pass
 
-        exitcode = self._process.wait() or 0
+        try:
+            exitcode = self._process.wait(5) or 0
+        except psutil.TimeoutExpired:
+            exitcode = 0
 
         # Dereference the internal _process attribute
         self._process = None
-        # Let's log and kill any child processes left behind, including the main
-        # subprocess if it failed to properly stop
+        # Lets log and kill any child processes left behind, including the main subprocess
+        # if it failed to properly stop
         terminate_process(
             pid=pid,
             kill_children=True,
@@ -1430,11 +1951,12 @@ class PkgSsmSaltDaemonImpl(PkgSystemdSaltDaemonImpl):
         pid = self.pid
         # Collect any child processes information before terminating the process
         with contextlib.suppress(psutil.NoSuchProcess):
-            for child in psutil.Process(pid).children(recursive=True):
-                # pylint: disable=access-member-before-definition
-                if child not in self._children:
-                    self._children.append(child)
-                # pylint: enable=access-member-before-definition
+            if not platform.is_darwin():
+                for child in psutil.Process(pid).children(recursive=True):
+                    # pylint: disable=access-member-before-definition
+                    if child not in self._children:
+                        self._children.append(child)
+                    # pylint: enable=access-member-before-definition
 
         if self._process.is_running():  # pragma: no cover
             cmdline = _get_cmdline(self._process)
@@ -1453,15 +1975,18 @@ class PkgSsmSaltDaemonImpl(PkgSystemdSaltDaemonImpl):
 
         if self._process.is_running():  # pragma: no cover
             try:
-                self._process.wait()
+                self._process.wait(10)
             except psutil.TimeoutExpired:
                 self._process.terminate()
                 try:
-                    self._process.wait()
+                    self._process.wait(10)
                 except psutil.TimeoutExpired:
                     pass
 
-        exitcode = self._process.wait() or 0
+        try:
+            exitcode = self._process.wait(5) or 0
+        except psutil.TimeoutExpired:
+            exitcode = 0
 
         # Dereference the internal _process attribute
         self._process = None
@@ -1610,20 +2135,6 @@ class SaltMasterWindows(SaltMaster):
             script_name="salt-master",
             code_dir=self.factories_manager.code_dir.parent,
         )
-
-        # XXX: Add install path to cli_scripts.generate_scripts?
-        def patch_script(script):
-            text = script.read_text()
-            newlines = []
-            for line in text.splitlines():
-                newlines.append(line)
-                if line == "sys.path.insert(0, CODE_DIR)":
-                    newlines.append(
-                        'sys.path.insert(0, "C:\\Program Files\\Salt Project\\Salt\\Lib\\site-packages")'
-                    )
-            script.write_text(os.linesep.join(newlines))
-
-        patch_script(self.factories_manager.scripts_dir / "cli_salt_master.py")
 
     def _get_impl_class(self):
         return DaemonImpl

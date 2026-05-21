@@ -28,6 +28,7 @@ import salt.exceptions
 # Solve the Chicken and egg problem where grains need to run before any
 # of the modules are loaded and are generally available for any usage.
 import salt.modules.cmdmod
+import salt.modules.file as file
 import salt.modules.network
 import salt.modules.smbios
 import salt.utils.args
@@ -1826,6 +1827,7 @@ _OS_NAME_MAP = {
     "rocky": "Rocky",
     "alibabaclo": "Alinux",
     "mendel": "Mendel",
+    "photon": "VMware Photon OS",
 }
 
 # This dictionary maps the pair of os-release ID and NAME to the 'os' grain
@@ -1902,6 +1904,10 @@ _OS_FAMILY_MAP = {
     "openSUSE Leap": "Suse",
     "openSUSE Tumbleweed": "Suse",
     "SLES_SAP": "Suse",
+    "alfaLinux": "Suse",
+    "alfaLinux Rise": "Suse",
+    "AlterOS": "RedHat",
+    "RED OS": "RedHat",
     "Arch ARM": "Arch",
     "Manjaro": "Arch",
     "Manjaro ARM": "Arch",
@@ -2991,12 +2997,12 @@ def ip_fqdn():
         if not ret["ipv" + ipv_num]:
             ret[key] = []
         else:
-            start_time = datetime.datetime.utcnow()
+            start_time = datetime.datetime.now(tz=datetime.timezone.utc)
             try:
                 info = socket.getaddrinfo(_fqdn, None, socket_type)
                 ret[key] = list({item[4][0] for item in info})
             except (OSError, UnicodeError):
-                timediff = datetime.datetime.utcnow() - start_time
+                timediff = datetime.datetime.now(tz=datetime.timezone.utc) - start_time
                 if timediff.seconds > 5 and __opts__["__role"] == "master":
                     log.warning(
                         'Unable to find IPv%s record for "%s" causing a %s '
@@ -3639,3 +3645,13 @@ def kernelparams():
             log.debug("Failed to read /proc/cmdline: %s", exc)
 
         return grains
+
+
+def fibre_channel_host():
+    """
+    Determine whether the minion is a fibre channel host
+    """
+    grains = {"fibre_channel_host": False}
+    if file.directory_exists("/sys/class/fc_host"):
+        grains["fibre_channel_host"] = True
+    return grains

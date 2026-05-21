@@ -77,6 +77,7 @@ def __virtual__():
         "virtuozzo",
         "issabel pbx",
         "openeuler",
+        "vmware photon os",
     )
 
     if os_family == "redhat" or os_grain in enabled:
@@ -449,10 +450,9 @@ def normalize_name(name):
             return name
     except ValueError:
         return name
-    if arch in (__grains__["osarch"], "noarch") or salt.utils.pkg.rpm.check_32(
-        arch, osarch=__grains__["osarch"]
-    ):
-        return name[: -(len(arch) + 1)]
+    stripped_name = name[: -(len(arch) + 1)]
+    if salt.utils.pkg.rpm.resolve_name(stripped_name, arch) == stripped_name:
+        return stripped_name
     return name
 
 

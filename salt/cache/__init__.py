@@ -12,6 +12,7 @@ from collections import OrderedDict
 import salt.config
 import salt.loader
 import salt.syspaths
+from salt.exceptions import SaltCacheError
 from salt.utils.decorators import cached_property
 
 log = logging.getLogger(__name__)
@@ -259,6 +260,36 @@ class Cache:
         fun = f"{self.driver}.list"
         return self.modules[fun](bank, **self.kwargs)
 
+    def list_all(self, bank, include_data=False):
+        """
+        Lists all entries with their data from the specified bank.
+        This is more efficient than calling list() + fetch() for each entry.
+
+        :param bank:
+            The name of the location inside the cache which will hold the key
+            and its associated data.
+
+        :param include_data:
+            Whether to include the full data for each entry. For some drivers
+            (like localfs_key), setting this to False avoids expensive disk reads.
+
+        :return:
+            A dict of {key: data} for all entries in the bank. Returns an empty
+            dict if the bank doesn't exist or the driver doesn't support list_all.
+
+        :raises SaltCacheError:
+            Raises an exception if cache driver detected an error accessing data
+            in the cache backend (auth, permissions, etc).
+        """
+        fun = f"{self.driver}.list_all"
+        if fun in self.modules:
+            return self.modules[fun](bank, include_data=include_data, **self.kwargs)
+        else:
+            # Fallback for drivers that don't implement list_all
+            raise AttributeError(
+                f"Cache driver '{self.driver}' does not implement list_all"
+            )
+
     def contains(self, bank, key=None):
         """
         Checks if the specified bank contains the specified key.
@@ -283,6 +314,32 @@ class Cache:
         """
         fun = f"{self.driver}.contains"
         return self.modules[fun](bank, key, **self.kwargs)
+
+    def clean_expired(self, bank, *args, **kwargs):
+        """
+        Clean expired keys
+
+        :param bank:
+            The name of the location inside the cache which will hold the key
+            and its associated data.
+
+        :raises SaltCacheError:
+            Raises an exception if cache driver detected an error accessing data
+            in the cache backend (auth, permissions, etc).
+        """
+        # If the cache driver has a clean_expired() func, call it to clean up
+        # expired keys.
+        clean_expired = f"{self.driver}.clean_expired"
+        if clean_expired in self.modules:
+            self.modules[clean_expired](bank, *args, **{**self.kwargs, **kwargs})
+        else:
+            list_ = f"{self.driver}.list"
+            updated = f"{self.driver}.updated"
+            flush = f"{self.driver}.flush"
+            for key in self.modules[list_](bank, **self.kwargs):
+                ts = self.modules[updated](bank, key, **self.kwargs)
+                if ts is not None and ts <= time.time():
+                    self.modules[flush](bank, key, **self.kwargs)
 
 
 class MemCache(Cache):
@@ -343,6 +400,8 @@ class MemCache(Cache):
                 (created_at, data) = record
             elif len(record) == 3:
                 (created_at, expires, data) = record
+            else:
+                raise SaltCacheError("Unexpected record structure")
 
             if (created_at + (expires or self.expire)) >= now:
                 if self.debug:

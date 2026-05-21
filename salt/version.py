@@ -635,7 +635,33 @@ def __discover_version(saltstack_version):
             saltstack_version.noc = -1
             return saltstack_version
 
-        return SaltStackVersion.parse(out)
+        parsed = SaltStackVersion.parse(out)
+        # ``git describe`` walks back to the nearest ``v*`` tag.  On a new
+        # release branch (e.g. ``3008.x``) there is often no ``v3008*``
+        # tag yet, so describe still reports ``v3007.13-N-gSHA``.  That is
+        # anchored on the previous Salt calver ``major`` line and breaks
+        # CI ``prepare-release`` and any tooling keyed off ``python3
+        # salt/version.py``.  When both sides use the post-3000 calver
+        # scheme, lift the baseline to this tree's unreleased codename
+        # (``SaltVersionsInfo.current_release()``) while preserving the
+        # offset and SHA from ``git describe``.  Same-major cases (e.g.
+        # prerelease tags) are left to normal ``git describe`` parsing.
+        if (
+            saltstack_version.new_version(saltstack_version.major)
+            and parsed.new_version(parsed.major)
+            and parsed.major < saltstack_version.major
+        ):
+            return SaltStackVersion(
+                saltstack_version.major,
+                saltstack_version.minor,
+                saltstack_version.bugfix,
+                saltstack_version.mbugfix,
+                saltstack_version.pre_type,
+                saltstack_version.pre_num,
+                noc=parsed.noc,
+                sha=parsed.sha,
+            )
+        return parsed
 
     except OSError as os_err:
         if os_err.errno != 2:
@@ -651,6 +677,9 @@ def __get_version(saltstack_version):
     If we can get a version provided at installation time or from Git, use
     that instead, otherwise we carry on.
     """
+    if "SALT_VERSION" in os.environ:
+        return SaltStackVersion.parse(os.environ["SALT_VERSION"])
+
     _hardcoded_version_file = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "_version.txt"
     )
@@ -706,7 +735,6 @@ def dependency_information(include_salt_cloud=False):
         ("M2Crypto", "M2Crypto", "version"),
         ("msgpack", "msgpack", "version"),
         ("msgpack-pure", "msgpack_pure", "version"),
-        ("networkx", "networkx", "__version__"),
         ("pycrypto", "Crypto", "__version__"),
         ("pycryptodome", "Cryptodome", "version_info"),
         ("cryptography", "cryptography", "__version__"),

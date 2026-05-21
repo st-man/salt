@@ -212,14 +212,17 @@ def get_process_info(pid=None):
     # another reasons is the process requires kernel permissions
     try:
         raw_process_info.status()
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
         return None
 
-    return {
-        "pid": raw_process_info.pid,
-        "name": raw_process_info.name(),
-        "start_time": raw_process_info.create_time(),
-    }
+    try:
+        return {
+            "pid": raw_process_info.pid,
+            "name": raw_process_info.name(),
+            "start_time": raw_process_info.create_time(),
+        }
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+        return None
 
 
 def claim_mantle_of_responsibility(file_name):
@@ -910,11 +913,13 @@ class Process(multiprocessing.Process):
         instance._finalize_methods = []
         instance.__logging_config__ = salt._logging.get_logging_options_dict()
 
-        if salt.utils.platform.spawning_platform():
-            # On spawning platforms, subclasses should call super if they define
-            # __setstate__ and/or __getstate__
-            instance._args_for_getstate = copy.copy(args)
-            instance._kwargs_for_getstate = copy.copy(kwargs)
+        # Always capture args/kwargs for pickling support.  On macOS/Windows
+        # (spawning platforms) this has always been needed.  On Linux, Python
+        # 3.14+ defaults to the "forkserver" multiprocessing start method which
+        # also requires pickling (e.g. in salt-ssh thin minion parallel states),
+        # so we set these unconditionally.
+        instance._args_for_getstate = copy.copy(args)
+        instance._kwargs_for_getstate = copy.copy(kwargs)
 
         # Because we need to enforce our after fork and finalize routines,
         # we must wrap this class run method to allow for these extra steps
@@ -946,6 +951,15 @@ class Process(multiprocessing.Process):
             self.register_after_fork_method(function, *args, **kwargs)
         for function, args, kwargs in state["finalize_methods"]:
             self.register_finalize_method(function, *args, **kwargs)
+        # _INTERNAL_PROCESS_FINALIZE_FUNCTION_LIST lives at module scope and
+        # is populated in the parent (e.g. by gitfs registering its lock
+        # cleanup). Under fork the child inherits it via memory copy, but
+        # forkserver/spawn give us a fresh interpreter where the list is
+        # empty -- breaking SIGTERM-triggered cleanup hooks. Re-seed it
+        # from the pickled parent state so cleanup_finalize_process has
+        # something to iterate.
+        for function, args, kwargs in state.get("internal_finalize_functions", []):
+            register_cleanup_finalize_function(function, *args, **kwargs)
 
     def __getstate__(self):
         """
@@ -962,6 +976,9 @@ class Process(multiprocessing.Process):
             "after_fork_methods": self._after_fork_methods,
             "finalize_methods": self._finalize_methods,
             "logging_config": self.__logging_config__,
+            "internal_finalize_functions": list(
+                _INTERNAL_PROCESS_FINALIZE_FUNCTION_LIST
+            ),
         }
 
     def __decorate_run(self, run_func):  # pylint: disable=unused-private-member
@@ -1186,16 +1203,20 @@ class SubprocessList:
     def cleanup(self):
         with self.lock:
             for proc in self.processes[:]:
-                proc.join(0.01)
-                if hasattr(proc, "exitcode"):
-                    # Only processes have exitcode and a close method, threads
-                    # do not.
-                    if proc.exitcode is None:
-                        continue
-                    proc.close()
-                else:
-                    if proc.is_alive():
-                        continue
+                try:
+                    proc.join(0.01)
+                    if hasattr(proc, "exitcode"):
+                        # Only processes have exitcode and a close method, threads
+                        # do not.
+                        if proc.exitcode is None:
+                            continue
+                        proc.close()
+                    else:
+                        if proc.is_alive():
+                            continue
+                except (ValueError, OSError):
+                    # Process may be closed or already cleaned up
+                    pass
                 self.processes.remove(proc)
                 self.count -= 1
                 log.debug("Subprocess %s cleaned up", proc.name)

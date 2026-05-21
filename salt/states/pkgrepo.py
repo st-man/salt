@@ -397,13 +397,13 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
         # If neither argument was passed we assume the repo will be enabled
         enabled = True
 
-    # To be changed in version 3008: default to False and still log a warning
+    # To be changed in version 3009: default to False and still log a warning
     allow_insecure_key = kwargs.pop("allow_insecure_key", True)
     key_is_insecure = kwargs.get("key_url", "").strip().startswith("http:")
     if key_is_insecure:
         if allow_insecure_key:
             salt.utils.versions.warn_until(
-                3008,
+                3009,
                 "allow_insecure_key will default to False starting in salt 3008.",
             )
         else:
@@ -415,7 +415,7 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
 
     kwargs["name"] = repo = name
 
-    if __grains__["os"] in ("Ubuntu", "Mint"):
+    if __grains__["os_family"] == "Debian":
         if ppa is not None:
             # overload the name/repo value for PPAs cleanly
             # this allows us to have one code-path for PPAs
@@ -547,6 +547,23 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
             ret["result"] = True
             ret["comment"] = f"Package repo '{name}' already configured"
             return ret
+
+    if __grains__["os_family"] == "Debian":
+        if (
+            "uri" not in kwargs
+            and "uri" in sanitizedkwargs
+            and "uri" in pre
+            and pre["uri"] != sanitizedkwargs["uri"]
+        ):
+            kwargs["uri"] = sanitizedkwargs["uri"]
+        if (
+            "uris" not in kwargs
+            and "uris" in sanitizedkwargs
+            and "uris" in pre
+            and sanitizedkwargs["uris"]
+            and sanitizedkwargs["uris"][0] not in pre["uris"]
+        ):
+            kwargs["uris"] = sanitizedkwargs["uris"]
 
     if __opts__["test"]:
         ret["comment"] = (

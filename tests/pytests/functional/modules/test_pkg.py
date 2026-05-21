@@ -65,7 +65,7 @@ def pkg_name(grains):
         _pkg = "putty"
     elif grains["os_family"] == "RedHat":
         if grains["os"] == "VMware Photon OS":
-            _pkg = "snoopy"
+            _pkg = "bc"
         elif grains["osfinger"] == "Amazon Linux-2023":
             return "dnf-utils"
         else:
@@ -134,7 +134,7 @@ def test_mod_del_repo(grains, modules):
 
             assert isinstance(ret, dict) is True
             assert ret["uri"] == uri
-        elif grains["os_family"] == "RedHat":
+        elif grains["os_family"] in ("RedHat", "Photon"):
             repo = "saltstack"
             name = "SaltStack repo for RHEL/CentOS {}".format(grains["osmajorrelease"])
             baseurl = "https://packages.broadcom.com/artifactory/saltproject-rpm/"
@@ -248,6 +248,10 @@ def test_which(modules, grains):
 @pytest.mark.requires_salt_modules("pkg.version", "pkg.install", "pkg.remove")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
+@pytest.mark.skipif(
+    bool(salt.utils.path.which("transactional-update")),
+    reason="Skipping on transactional systems",
+)
 def test_install_remove(modules, pkg_name):
     """
     successfully install and uninstall a package
@@ -289,6 +293,10 @@ def test_install_remove(modules, pkg_name):
 @pytest.mark.slow_test
 @pytest.mark.requires_network
 @pytest.mark.requires_salt_states("pkg.installed")
+@pytest.mark.skipif(
+    bool(salt.utils.path.which("transactional-update")),
+    reason="Skipping on transactional systems",
+)
 def test_hold_unhold(grains, modules, states, pkg_name):
     """
     test holding and unholding a package
@@ -374,10 +382,16 @@ def test_pkg_info(grains, modules, pkg_name):
         assert "bash" in keys
         assert "dpkg" in keys
     elif grains["os_family"] == "RedHat":
-        ret = modules.pkg.info_installed("rpm", "bash")
-        keys = ret.keys()
-        assert "rpm" in keys
-        assert "bash" in keys
+        if grains["os"] == "VMware Photon OS":
+            ret = modules.pkg.info_installed("tdnf", "bash")
+            keys = ret.keys()
+            assert "tdnf" in keys
+            assert "bash" in keys
+        else:
+            ret = modules.pkg.info_installed("rpm", "bash")
+            keys = ret.keys()
+            assert "rpm" in keys
+            assert "bash" in keys
     elif grains["os_family"] == "Suse":
         ret = modules.pkg.info_installed("less", "zypper")
         keys = ret.keys()

@@ -261,7 +261,7 @@ def download_artifact(
             "help": "The workflow run ID from where to download artifacts from",
         },
         "slug": {
-            "help": "Slug of the test run (examples: debian-11, macos-13, windows-2022)",
+            "help": "Slug of the test run (examples: debian-11, macos-15-intel, windows-2022)",
         },
         "repository": {
             "help": "The repository to query, e.g. saltstack/salt",
@@ -284,6 +284,19 @@ def test_artifacts(
             if _.slug == slug:
                 ctx.info(f"Found platform definition {slug}")
                 platdef = _
+                break
+
+    # Package-only slugs (e.g. ``amazonlinux-2023-pkg``) live under
+    # ``test-salt-pkg-listing`` but not ``test-salt-listing``. Re-use the pkg
+    # row for onedir/nox artifact globs (platform + arch).
+    if not platdef:
+        for platform in PLATFORMS:
+            for _ in TEST_SALT_PKG_LISTING[platform]:
+                if _.slug == slug:
+                    ctx.info(f"Found package-matrix definition {slug}")
+                    platdef = _
+                    break
+            if platdef:
                 break
 
     if not platdef:
@@ -317,7 +330,8 @@ def test_artifacts(
     ]
     if pkgdef:
         for _ in pkgdef:
-            artifacts.append(("artifacts/pkg/", f"salt-*-{_.arch}-{_.pkg_type}"))
+            # CI artifact names may add a suffix (e.g. ``-from-src``) after the type.
+            artifacts.append(("artifacts/pkg/", f"salt-*-{_.arch}-{_.pkg_type}*"))
     for dest, artifact_name in artifacts:
         succeeded = tools.utils.gh.download_artifact(
             ctx,

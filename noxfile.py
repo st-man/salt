@@ -200,12 +200,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     if IS_WINDOWS:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "windows.txt"
+                "requirements", "static", requirements_type, pydir, "windows.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "windows-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "windows-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -213,12 +213,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     elif IS_DARWIN:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "darwin.txt"
+                "requirements", "static", requirements_type, pydir, "darwin.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "darwin-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "darwin-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -226,12 +226,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     elif IS_FREEBSD:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "freebsd.txt"
+                "requirements", "static", requirements_type, pydir, "freebsd.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "freebsd-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "freebsd-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -239,12 +239,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     else:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "linux.txt"
+                "requirements", "static", requirements_type, pydir, "linux.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "linux-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "linux-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -291,6 +291,18 @@ def _install_requirements(
     # Install requirements
     env = os.environ.copy()
     env["PIP_CONSTRAINT"] = str(REPO_ROOT / "requirements" / "constraints.txt")
+
+    if onedir and IS_LINUX:
+        # bcrypt's PyPI wheels are tagged manylinux_2_28+ on the cpXY-abi3
+        # variants pip prefers on a modern build host, but the resulting
+        # ``_bcrypt.abi3.so`` then fails to load on older-glibc test hosts
+        # (e.g. Amazon Linux 2 with GLIBC 2.26). Source-compile bcrypt
+        # against the relenv toolchain so the resulting binary is portable
+        # across every Linux test slug. ``RELENV_BUILDENV=1`` makes the
+        # source build use ppbt's portable GCC + low-GLIBC sysroot (no
+        # effect on packages still installed as wheels).
+        env["PIP_NO_BINARY"] = "bcrypt"
+        env["RELENV_BUILDENV"] = "1"
 
     requirements_file = _get_pip_requirements_file(
         session, requirements_type=requirements_type
@@ -921,10 +933,10 @@ def test_cloud(session, coverage):
     # Install requirements
     if _upgrade_pip_setuptools_and_wheel(session):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", pydir, "linux.txt"
+            "requirements", "static", "ci", pydir, "linux.lock"
         )
         cloud_requirements_file = os.path.join(
-            "requirements", "static", "ci", pydir, "cloud.txt"
+            "requirements", "static", "ci", pydir, "cloud.lock"
         )
 
         install_command = [
@@ -1276,32 +1288,28 @@ def decompress_dependencies(session):
         nox_dependencies_tarball_path.unlink()
 
     session.log("Finding broken 'python' symlinks and configs under '.nox/' ...")
-    for dirname in os.scandir(REPO_ROOT / ".nox"):
-        pyenv = REPO_ROOT.joinpath(".nox", dirname, "pyvenv.cfg")
-        pyenv_vars = []
-        if os.path.exists(pyenv):
-            # Update pyvenv.cnf configuration in case the location of
-            # everything changed.
-            with open(pyenv, encoding="utf-8") as fp:
-                for line in fp.readlines():
-                    k, v = (_.strip() for _ in line.split("=", 1))
-                    if k in [
-                        "home",
-                        "base-prefix",
-                        "base-exec-prefix",
-                        "base-executable",
-                    ]:
-                        root, _path = v.split("artifacts" + os.path.sep, 1)
-                        v = str(REPO_ROOT / "artifacts" / _path)
-                    pyenv_vars.append((k, v))
-            with open(pyenv, "w", encoding="utf-8") as fp:
-                for k, v in pyenv_vars:
-                    fp.write(f"{k} = {v}\n")
+    # ``compress-dependencies`` archives the whole ``.nox`` tree. That tree is not
+    # only per-session virtualenv folders (``ci-test-onedir``, etc.): it can also
+    # contain plain files written by tooling, for example:
+    #
+    #   - ``.nox/.gitignore`` — tells Git to ignore generated venv files
+    #   - ``.nox/CACHEDIR.TAG`` — cache-dir marker used by virtualenv and similar tools
+    #
+    # Those files are siblings of the venv directories. The code below must only
+    # treat *directories* as virtualenvs. Otherwise we build paths like
+    # ``.nox/.gitignore/Scripts`` and ``os.scandir`` raises FileNotFoundError.
+    for entry in os.scandir(REPO_ROOT / ".nox"):
+        if not entry.is_dir():
+            continue
 
-        scan_path = REPO_ROOT.joinpath(".nox", dirname, scripts_dir_name)
+        venv_dir = pathlib.Path(entry.path)
+        scan_path = venv_dir / scripts_dir_name
+        if not scan_path.is_dir():
+            # Unexpected layout; skip rather than failing the whole session.
+            continue
 
         # Fix the values of the directories in a pyvenv.cfg file.
-        config = pathlib.Path(dirname) / "pyvenv.cfg"
+        config = venv_dir / "pyvenv.cfg"
         values = {}
         if config.exists():
             session.log(f"Found venv config: {config}")
@@ -1321,7 +1329,7 @@ def decompress_dependencies(session):
                 for key in values:
                     fp.write(f"{key} = {values[key]}\n")
         else:
-            session.log(f"{config} does not exist")
+            session.log(f"{config} does not exist in .nox/{entry.name}")
 
         script_paths = {str(p): p for p in os.scandir(scan_path)}
         fixed_shebang = f"#!{scan_path / 'python'}"
@@ -1347,7 +1355,7 @@ def decompress_dependencies(session):
                     )
                     session.log(
                         "Fixing broken symlink in nox virtualenv %r, from %r to %r",
-                        dirname.name,
+                        entry.name,
                         resolved_link,
                         str(fixed_link.relative_to(REPO_ROOT)),
                     )
@@ -1438,12 +1446,14 @@ def pre_archive_cleanup(session, pkg):
 
     if _upgrade_pip_setuptools_and_wheel(session):
         requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "tools.txt"
+            "requirements", "static", "ci", _get_pydir(session), "tools.lock"
         )
         install_command = ["--progress-bar=off", "-r", requirements_file]
         session.install(*install_command, silent=PIP_INSTALL_SILENT)
 
     cmdline = [
+        "python",
+        "-m",
         "tools",
         "pkg",
         "pre-archive-cleanup",
@@ -1532,10 +1542,10 @@ class Tee:
 def _lint(session, rcfile, flags, paths, upgrade_setuptools_and_pip=True):
     if _upgrade_pip_setuptools_and_wheel(session, upgrade=upgrade_setuptools_and_pip):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "linux.txt"
+            "requirements", "static", "ci", _get_pydir(session), "linux.lock"
         )
         lint_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "lint.txt"
+            "requirements", "static", "ci", _get_pydir(session), "lint.lock"
         )
         install_command = [
             "--progress-bar=off",
@@ -1674,12 +1684,12 @@ def docs_html(session, compress, clean):
     """
     if _upgrade_pip_setuptools_and_wheel(session):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "linux.txt"
+            "requirements", "static", "ci", _get_pydir(session), "linux.lock"
         )
-        base_requirements_file = os.path.join("requirements", "base.txt")
-        zeromq_requirements_file = os.path.join("requirements", "zeromq.txt")
+        base_requirements_file = os.path.join("requirements", "base.in")
+        zeromq_requirements_file = os.path.join("requirements", "zeromq.in")
         docs_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "docs.txt"
+            "requirements", "static", "ci", _get_pydir(session), "docs.lock"
         )
         install_command = [
             "--progress-bar=off",
@@ -1712,12 +1722,12 @@ def docs_man(session, compress, update, clean):
     """
     if _upgrade_pip_setuptools_and_wheel(session):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "linux.txt"
+            "requirements", "static", "ci", _get_pydir(session), "linux.lock"
         )
-        base_requirements_file = os.path.join("requirements", "base.txt")
-        zeromq_requirements_file = os.path.join("requirements", "zeromq.txt")
+        base_requirements_file = os.path.join("requirements", "base.in")
+        zeromq_requirements_file = os.path.join("requirements", "zeromq.in")
         docs_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "docs.txt"
+            "requirements", "static", "ci", _get_pydir(session), "docs.lock"
         )
         install_command = [
             "--progress-bar=off",
@@ -1756,7 +1766,7 @@ def changelog(session, draft, force):
     )
     if _upgrade_pip_setuptools_and_wheel(session):
         requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "tools.txt"
+            "requirements", "static", "ci", _get_pydir(session), "tools.lock"
         )
         install_command = ["--progress-bar=off", "-r", requirements_file]
         session.install(*install_command, silent=PIP_INSTALL_SILENT)
@@ -1841,7 +1851,7 @@ def build(session):
         session.install(
             "--progress-bar=off",
             "-r",
-            "requirements/build.txt",
+            "requirements/build.in",
             silent=PIP_INSTALL_SILENT,
         )
 

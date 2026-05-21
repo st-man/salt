@@ -30,6 +30,7 @@ import salt.exceptions
 import salt.loader
 import salt.minion
 import salt.output
+import salt.pillar
 import salt.roster
 import salt.serializers.yaml
 import salt.state
@@ -45,6 +46,7 @@ import salt.utils.platform
 import salt.utils.relenv
 import salt.utils.stringutils
 import salt.utils.thin
+import salt.utils.timeutil
 import salt.utils.url
 import salt.utils.verify
 from salt._logging import LOG_LEVELS
@@ -81,6 +83,33 @@ RSTR = "_edbc7885e4f9aac9b83b35999b68d015148caf467b78fa39c05f669c0ff89878"
 # The regex to find RSTR in output - Must be on an output line by itself
 # NOTE - must use non-grouping match groups or output splitting will fail.
 RSTR_RE = r"(?:^|\r?\n)" + RSTR + r"(?:\r?\n|$)"
+
+
+def _ssh_cli_process_exit_code(retcode):
+    """
+    Map shim / per-minion retcodes to the salt-ssh CLI process exit code.
+
+    Codes for thin transfer, checksum, and similar infrastructure faults are
+    returned unchanged so callers can distinguish them. Typical execution
+    failures (including module and state retcodes) are collapsed to
+    :const:`~salt.defaults.exitcodes.EX_AGGREGATE`, matching salt-ssh tests and
+    the documented "one of a collection failed" semantics.
+    """
+    if retcode == salt.defaults.exitcodes.EX_OK:
+        return retcode
+    preserved = (
+        salt.defaults.exitcodes.EX_THIN_PYTHON_INVALID,
+        salt.defaults.exitcodes.EX_THIN_DEPLOY,
+        salt.defaults.exitcodes.EX_THIN_CHECKSUM,
+        salt.defaults.exitcodes.EX_MOD_DEPLOY,
+        salt.defaults.exitcodes.EX_SCP_NOT_FOUND,
+        salt.defaults.exitcodes.EX_CANTCREAT,
+        salt.defaults.exitcodes.EX_SOFTWARE,
+    )
+    if retcode in preserved:
+        return retcode
+    return salt.defaults.exitcodes.EX_AGGREGATE
+
 
 # METHODOLOGY:
 #
@@ -212,13 +241,14 @@ SUDO_USER="{SUDO_USER}"
 if [ "$SUDO" ] && [ "$SUDO_USER" ]; then SUDO="$SUDO -u $SUDO_USER"; fi
 
 RELENV_TAR="{THIN_DIR}/salt-relenv.tar.xz"
+EXT_MODS_TAR="{THIN_DIR}/salt-ext_mods.tgz"
+EXT_MODS_VERSION="{EXT_MODS_VERSION}"
 mkdir -p "{THIN_DIR}"
 SALT_CALL_BIN="{THIN_DIR}/salt-call"
 
 # Extract relenv tarball if not already extracted
 if [ ! -x "$SALT_CALL_BIN" ]; then
     if [ ! -f "$RELENV_TAR" ]; then
-        echo deploy
         echo "ERROR: relenv tarball not found at $RELENV_TAR" >&2
         exit 11
     fi
@@ -233,10 +263,40 @@ if [ ! -x "$SALT_CALL_BIN" ]; then
     exit 1
 fi
 
+# Handle extension modules with version checking (similar to thin)
+if [ -n "$EXT_MODS_VERSION" ]; then
+    # Check if we already have the correct version
+    EXT_VERSION_FILE="{THIN_DIR}/ext_version"
+    CURRENT_VERSION=$(cat "$EXT_VERSION_FILE" 2>/dev/null || echo "")
+
+    if [ "$CURRENT_VERSION" != "$EXT_MODS_VERSION" ]; then
+        # Version mismatch or no version file - need fresh ext_mods
+        if [ -f "$EXT_MODS_TAR" ]; then
+            # Extract the tarball
+            EXTMODS_DIR="{THIN_DIR}/running_data/var/cache/salt/minion/extmods"
+            mkdir -p "$EXTMODS_DIR"
+            tar -xzf "$EXT_MODS_TAR" -C "$EXTMODS_DIR"
+            rm -f "$EXT_MODS_TAR"
+            # Version file should be in the tarball, move it to thin_dir
+            if [ -f "$EXTMODS_DIR/ext_version" ]; then
+                mv "$EXTMODS_DIR/ext_version" "{THIN_DIR}/ext_version"
+            fi
+        else
+            # No tarball present - request from master
+            echo "{RSTR}"
+            echo ext_mods
+            exit 13
+        fi
+    fi
+fi
+
 echo "{RSTR}"
 echo "{RSTR}" >&2
 
-exec $SUDO "$SALT_CALL_BIN" --retcode-passthrough --local --metadata --out=json -lquiet -c "{THIN_DIR}" {ARGS}
+# Debug: Show the actual command being executed
+echo "SALT_CALL_CMD: $SALT_CALL_BIN --retcode-passthrough --local --metadata --out=json -lquiet -c {THIN_DIR} -- {ARGS}" >&2
+
+exec $SUDO "$SALT_CALL_BIN" --retcode-passthrough --local --metadata --out=json -lquiet -c "{THIN_DIR}" -- {ARGS}
 EOF
 """.split(
             "\n"
@@ -388,6 +448,7 @@ class SSH(MultiprocessingStateMixin):
                 saltext_allowlist=self.opts.get("thin_saltext_allowlist"),
                 saltext_blocklist=self.opts.get("thin_saltext_blocklist"),
             )
+
         self.mods = mod_data(self.fsclient)
 
     # __setstate__ and __getstate__ are only used on spawning platforms.
@@ -479,7 +540,7 @@ class SSH(MultiprocessingStateMixin):
                         '# Automatically added by "{s_user}" at {s_time}\n{hostname}:\n'
                         "    host: {hostname}\n    user: {user}\n    passwd: {passwd}\n".format(
                             s_user=getpass.getuser(),
-                            s_time=datetime.datetime.utcnow().isoformat(),
+                            s_time=salt.utils.timeutil.utcnow().isoformat(),
                             hostname=self.opts.get("tgt", ""),
                             user=self.opts.get("ssh_user", ""),
                             passwd=self.opts.get("ssh_passwd", ""),
@@ -594,7 +655,7 @@ class SSH(MultiprocessingStateMixin):
                 thin=self.thin,
                 **target,
             )
-            stdout, stderr, retcode = single.cmd_block()
+            stdout, stderr, retcode = single.run()
             try:
                 retcode = int(retcode)
             except (TypeError, ValueError):
@@ -876,6 +937,14 @@ class SSH(MultiprocessingStateMixin):
         """
         Execute the overall routine, print results via outputters
         """
+        # Recursion protection for nested salt-ssh calls (e.g. mine.get)
+        if "salt_ssh_recursion_depth" not in self.opts:
+            self.opts["salt_ssh_recursion_depth"] = 0
+        self.opts["salt_ssh_recursion_depth"] += 1
+        if self.opts["salt_ssh_recursion_depth"] > 10:
+            log.error("salt-ssh recursion depth limit exceeded (10)")
+            return {"error": "salt-ssh recursion depth limit exceeded"}
+
         if self.opts.get("list_hosts"):
             self._get_roster()
             ret = {}
@@ -931,6 +1000,17 @@ class SSH(MultiprocessingStateMixin):
                 exc_info=True,
             )
 
+        # Save the job information to the master's proc directory
+        # so that state.running can find it.
+        proc_dir = os.path.join(self.opts["cachedir"], "proc")
+        if not os.path.isdir(proc_dir):
+            os.makedirs(proc_dir)
+        proc_file = os.path.join(proc_dir, jid)
+        with salt.utils.files.fopen(proc_file, "w+b") as fp_:
+            # Add PID to job_load
+            job_load["pid"] = os.getpid()
+            fp_.write(salt.payload.dumps(job_load))
+
         if self.opts.get("verbose"):
             msg = f"Executing job with jid {jid}"
             print(msg)
@@ -939,77 +1019,87 @@ class SSH(MultiprocessingStateMixin):
         sret = {}
         outputter = self.opts.get("output", "nested")
         final_exit = salt.defaults.exitcodes.EX_OK
-        for ret, retcode in self.handle_ssh():
-            host = next(iter(ret))
-            if not isinstance(retcode, int):
-                log.warning("Host '%s' returned an invalid retcode: %s", host, retcode)
-                retcode = 1
-            final_exit = max(final_exit, retcode)
-
-            self.cache_job(jid, host, ret[host], fun)
-            ret, deploy_retcode = self.key_deploy(host, ret)
-            if deploy_retcode is not None:
-                try:
-                    retcode = int(deploy_retcode)
-                except (TypeError, ValueError):
+        try:
+            for ret, retcode in self.handle_ssh():
+                host = next(iter(ret))
+                if not isinstance(retcode, int):
                     log.warning(
-                        "Got an invalid deploy retcode for host '%s': '%s'",
-                        host,
-                        retcode,
+                        "Host '%s' returned an invalid retcode: %s", host, retcode
                     )
                     retcode = 1
-            final_exit = max(final_exit, retcode)
+                final_exit = max(final_exit, _ssh_cli_process_exit_code(retcode))
 
-            if isinstance(ret[host], dict) and (
-                ret[host].get("stderr") or ""
-            ).startswith("ssh:"):
-                ret[host] = ret[host]["stderr"]
+                self.cache_job(jid, host, ret[host], fun)
+                ret, deploy_retcode = self.key_deploy(host, ret)
+                if deploy_retcode is not None:
+                    try:
+                        retcode = int(deploy_retcode)
+                    except (TypeError, ValueError):
+                        log.warning(
+                            "Got an invalid deploy retcode for host '%s': '%s'",
+                            host,
+                            retcode,
+                        )
+                        retcode = 1
+                final_exit = max(final_exit, _ssh_cli_process_exit_code(retcode))
 
-            if not isinstance(ret[host], dict):
-                p_data = {host: ret[host]}
-            elif "return" not in ret[host]:
-                if ret[host].get("_error") == "Permission denied":
-                    p_data = {host: ret[host]["stderr"]}
-                else:
-                    p_data = ret
-            else:
-                outputter = ret[host].get("out", self.opts.get("output", "nested"))
-                p_data = {host: ret[host].get("return", {})}
-            if self.opts.get("static"):
-                sret.update(p_data)
-            else:
-                salt.output.display_output(p_data, outputter, self.opts)
-            if self.event:
-                id_, data = next(iter(ret.items()))
-                if not isinstance(data, dict):
-                    data = {"return": data}
-                if "id" not in data:
-                    data["id"] = id_
-                if "fun" not in data:
-                    data["fun"] = fun
-                if "fun_args" not in data:
-                    data["fun_args"] = args
-                if "retcode" not in data:
-                    data["retcode"] = retcode
-                if "success" not in data:
-                    data["success"] = data["retcode"] == salt.defaults.exitcodes.EX_OK
-                if "return" not in data:
-                    if data["success"]:
-                        data["return"] = data.get("stdout")
+                if isinstance(ret[host], dict) and (
+                    ret[host].get("stderr") or ""
+                ).startswith("ssh:"):
+                    ret[host] = ret[host]["stderr"]
+
+                if not isinstance(ret[host], dict):
+                    p_data = {host: ret[host]}
+                elif "return" not in ret[host]:
+                    if ret[host].get("_error") == "Permission denied":
+                        p_data = {host: ret[host]["stderr"]}
                     else:
-                        data["return"] = data.get("stderr", data.get("stdout"))
-                data["jid"] = (
-                    jid  # make the jid in the payload the same as the jid in the tag
-                )
-                self.event.fire_event(
-                    data, salt.utils.event.tagify([jid, "ret", host], "job")
-                )
+                        p_data = ret
+                else:
+                    outputter = ret[host].get("out", self.opts.get("output", "nested"))
+                    p_data = {host: ret[host].get("return", {})}
+
+                sret.update(p_data)
+                if not self.opts.get("static"):
+                    salt.output.display_output(p_data, outputter, self.opts)
+                if self.event:
+                    id_, data = next(iter(ret.items()))
+                    if not isinstance(data, dict):
+                        data = {"return": data}
+                    if "id" not in data:
+                        data["id"] = id_
+                    if "fun" not in data:
+                        data["fun"] = fun
+                    if "fun_args" not in data:
+                        data["fun_args"] = args
+                    if "retcode" not in data:
+                        data["retcode"] = retcode
+                    if "success" not in data:
+                        data["success"] = (
+                            data["retcode"] == salt.defaults.exitcodes.EX_OK
+                        )
+                    if "return" not in data:
+                        if data["success"]:
+                            data["return"] = data.get("stdout")
+                        else:
+                            data["return"] = data.get("stderr", data.get("stdout"))
+                    data["jid"] = (
+                        jid  # make the jid in the payload the same as the jid in the tag
+                    )
+                    self.event.fire_event(
+                        data, salt.utils.event.tagify([jid, "ret", host], "job")
+                    )
+        finally:
+            if os.path.exists(proc_file):
+                os.remove(proc_file)
         if self.event is not None:
             self.event.destroy()
         if self.opts.get("static"):
             salt.output.display_output(sret, outputter, self.opts)
+
         if final_exit:
-            sys.exit(salt.defaults.exitcodes.EX_AGGREGATE)
+            sys.exit(final_exit)
+        return sret
 
 
 class Single:
@@ -1070,7 +1160,10 @@ class Single:
             self.python_env = kwargs.get("ssh_python_env")
         else:
             if user:
-                thin_dir = DEFAULT_THIN_DIR.replace("%%USER%%", user)
+                thin_dir = DEFAULT_THIN_DIR.replace(
+                    "%%USER%%",
+                    re.sub(r"[^a-zA-Z0-9\._\-@]", "_", user),
+                )
             else:
                 thin_dir = DEFAULT_THIN_DIR.replace("%%USER%%", "root")
             self.thin_dir = thin_dir.replace(
@@ -1079,6 +1172,13 @@ class Single:
                     :6
                 ],
             )
+            # Differentiate between thin and relenv deployments to avoid contamination
+            if self.opts.get("relenv"):
+                self.thin_dir = self.thin_dir.replace("_salt", "_salt_relenv")
+                log.info(
+                    "RELENV: Configured thin_dir=%s for relenv deployment",
+                    self.thin_dir,
+                )
         self.opts["thin_dir"] = self.thin_dir
         self.fsclient = fsclient
         self.context = {"master_opts": self.opts, "fileclient": self.fsclient}
@@ -1148,10 +1248,59 @@ class Single:
             self.arch = arch.strip()
 
         if self.opts.get("relenv"):
-            kernel, os_arch = self.detect_os_arch()
-            self.thin = salt.utils.relenv.gen_relenv(
-                opts["cachedir"], kernel=kernel, os_arch=os_arch
+            # Check if OS/arch already detected and cached in opts
+            if "relenv_kernel" in opts and "relenv_os_arch" in opts:
+                kernel = opts["relenv_kernel"]
+                os_arch = opts["relenv_os_arch"]
+                log.warning(f"RELENV: Reusing cached OS/arch: {kernel}/{os_arch}")
+            else:
+                # First Single instance - detect and cache OS/arch in opts before assigning to self.opts
+                kernel, os_arch = self.detect_os_arch()
+                opts["relenv_kernel"] = kernel
+                opts["relenv_os_arch"] = os_arch
+                log.warning(f"RELENV: Detected and cached OS/arch: {kernel}/{os_arch}")
+
+            log.info(
+                "RELENV: About to call gen_relenv() to download/generate tarball..."
             )
+            self.thin = salt.utils.relenv.gen_relenv(
+                self.opts["cachedir"], kernel=kernel, os_arch=os_arch
+            )
+            log.info(
+                "RELENV: gen_relenv() completed successfully, tarball path: %s",
+                self.thin,
+            )
+
+            # Add file_roots and related config to minion config
+            # (required for slsutil functions and other fileserver operations)
+            # Thin does this in _run_wfunc_thin() at lines 1498-1507
+            # NOTE: Now that we transfer config via SCP instead of embedding in command line,
+            # we CAN add __master_opts__ without hitting ARG_MAX limits
+            self.minion_opts["file_roots"] = self.opts["file_roots"]
+            self.minion_opts["pillar_roots"] = self.opts["pillar_roots"]
+            self.minion_opts["ext_pillar"] = self.opts["ext_pillar"]
+            # For relenv, we need to override extension_modules to point to where the shim
+            # extracts the tarball on the remote system. The wrapper system will copy this
+            # to opts_pkg["extension_modules"] which is used by salt-call.
+            self.minion_opts["extension_modules"] = (
+                f"{self.thin_dir}/running_data/var/cache/salt/minion/extmods"
+            )
+            self.minion_opts["module_dirs"] = self.opts["module_dirs"]
+            self.minion_opts["__master_opts__"] = self.context["master_opts"]
+
+            # Re-serialize the minion config after updating relenv-specific paths
+            # This ensures the config file sent to the remote system has the correct extension_modules path
+            self.minion_config = salt.serializers.yaml.serialize(self.minion_opts)
+            log.debug(
+                "RELENV: Re-serialized minion config with extension_modules=%s",
+                self.minion_opts["extension_modules"],
+            )
+
+            # NOTE: We no longer pre-compile pillar for relenv here.
+            # Both thin and relenv now use the wrapper system (_run_wfunc_thin())
+            # which compiles pillar dynamically, ensuring correct behavior with pillar overrides:
+            # - 1x compilation without pillar overrides
+            # - 2x compilation with pillar overrides (re-compiled in wrapper modules)
         else:
             self.thin = thin if thin else salt.utils.thin.thin_path(opts["cachedir"])
 
@@ -1183,10 +1332,12 @@ class Single:
                 raise ValueError(f"Unsupported Unix-based kernel: {stdout}")
 
             # Set architecture
-            if "x86" in stdout:
+            if re.search(r"x86_64|amd64", stdout):
                 os_arch = "x86_64"
-            else:
+            elif re.search(r"aarch64|arm64", stdout):
                 os_arch = "arm64"
+            else:
+                os_arch = stdout.split()[-1] if stdout.split() else "unknown"
         else:
             # If Unix detection fails, check for Windows-specific detection
             stdout, stderr, retcode = self.shell.exec_cmd(windows_cmd)
@@ -1369,6 +1520,20 @@ class Single:
         """
         Execute a wrapper function
 
+        Both thin and relenv use the wrapper system (FunctionWrapper).
+        The wrapper system handles pillar compilation correctly:
+        - 1x compilation without pillar overrides
+        - 2x compilation with pillar overrides (re-compiled in wrapper modules)
+
+        Returns tuple of (json_data, '')
+        """
+        return self._run_wfunc_thin()
+
+    def _run_wfunc_thin(self):
+        """
+        Execute a wrapper function using the thin/wrapper architecture.
+        This is the original implementation for thin deployments.
+
         Returns tuple of (json_data, '')
         """
         # Ensure that opts/grains are up to date
@@ -1411,7 +1576,19 @@ class Single:
             opts_pkg["file_roots"] = self.opts["file_roots"]
             opts_pkg["pillar_roots"] = self.opts["pillar_roots"]
             opts_pkg["ext_pillar"] = self.opts["ext_pillar"]
-            opts_pkg["extension_modules"] = self.opts["extension_modules"]
+            # For SSH, don't override extension_modules if it's already set correctly in minion_opts
+            # (pointing to the remote system's cache, not the master's cache)
+            if (
+                "extension_modules" not in opts_pkg
+                or opts_pkg["extension_modules"] == self.opts["extension_modules"]
+            ):
+                # Only override if it's still using the master's path or not set
+                if "extension_modules" in self.minion_opts:
+                    opts_pkg["extension_modules"] = self.minion_opts[
+                        "extension_modules"
+                    ]
+                else:
+                    opts_pkg["extension_modules"] = self.opts["extension_modules"]
             opts_pkg["module_dirs"] = self.opts["module_dirs"]
             opts_pkg["_ssh_version"] = self.opts["_ssh_version"]
             opts_pkg["thin_dir"] = self.opts["thin_dir"]
@@ -1465,13 +1642,15 @@ class Single:
         opts = data.get("opts", {})
         opts["grains"] = data.get("grains")
 
-        # Restore master grains
-        for grain in conf_grains:
-            opts["grains"][grain] = conf_grains[grain]
-        # Enable roster grains support
+        # Restore master grains and roster grains
+        # Use dict merge instead of nested mutations to avoid OptsDict deepcopy
+        grains_updates = {}
+        grains_updates.update(conf_grains)
         if "grains" in self.target:
-            for grain in self.target["grains"]:
-                opts["grains"][grain] = self.target["grains"][grain]
+            grains_updates.update(self.target["grains"])
+
+        if grains_updates:
+            opts["grains"] = {**opts["grains"], **grains_updates}
 
         opts["pillar"] = data.get("pillar")
 
@@ -1481,6 +1660,14 @@ class Single:
         # above always evaluates to True. TODO: cleanup?
         opts["ssh_wipe"] = self.opts.get("ssh_wipe", False)
 
+        # Propagate relenv settings to nested Single instances (wrapper-initiated calls)
+        # This ensures nested calls use relenv code path instead of falling back to thin
+        if self.opts.get("relenv"):
+            opts["relenv"] = True
+            if "relenv_kernel" in self.opts and "relenv_os_arch" in self.opts:
+                opts["relenv_kernel"] = self.opts["relenv_kernel"]
+                opts["relenv_os_arch"] = self.opts["relenv_os_arch"]
+
         wrapper = salt.client.ssh.wrapper.FunctionWrapper(
             opts,
             self.id,
@@ -1488,7 +1675,6 @@ class Single:
             minion_opts=self.minion_opts,
             **self.target,
         )
-        wrapper.fsclient.opts["cachedir"] = opts["cachedir"]
         self.wfuncs = salt.loader.ssh_wrapper(opts, wrapper, self.context)
         wrapper.wfuncs = self.wfuncs
 
@@ -1528,7 +1714,7 @@ class Single:
                 self.args = mine_args
                 self.kwargs = {}
 
-        retcode = 0
+        retcode = salt.defaults.exitcodes.EX_OK
         try:
             if self.mine:
                 result = wrapper[mine_fun](*self.args, **self.kwargs)
@@ -1573,6 +1759,136 @@ class Single:
             ret = salt.utils.json.dumps({"local": {"return": result}})
         return ret, retcode
 
+    def _run_wfunc_relenv(self):
+        """
+        Execute a function using salt-call from relenv deployment.
+        Bypasses the wrapper system entirely since relenv includes a full salt-call binary.
+
+        Returns tuple of (json_data, retcode)
+        """
+        log.info(
+            "RELENV WFUNC: Starting execution - fun=%s, thin_dir=%s",
+            self.fun,
+            self.thin_dir,
+        )
+
+        # Build salt-call command - relenv has full salt-call binary
+        salt_call = f"{self.thin_dir}/salt-call"
+        args_str = self._build_salt_call_args()
+
+        log.info("RELENV WFUNC: Built args string: %s", args_str)
+
+        # Determine output level
+        log_level = self.opts.get("log_level", "error")
+
+        # Config directory for relenv (where minion config with file_roots/pillar is located)
+        config_dir = f"{self.thin_dir}/conf"
+
+        # Build full command with config-dir so salt-call can find the minion config
+        cmd = f"{salt_call} --local --config-dir={config_dir} {self.fun} {args_str} --out=json --log-level={log_level}"
+
+        log.info("RELENV WFUNC: About to execute command: %s", cmd)
+
+        # Execute via shell
+        log.info("RELENV WFUNC: Calling self.shell.exec_cmd()...")
+        stdout, stderr, retcode = self.shell.exec_cmd(cmd)
+        log.info(
+            "RELENV WFUNC: exec_cmd() returned - retcode=%s, stdout_len=%d, stderr_len=%d",
+            retcode,
+            len(stdout) if stdout else 0,
+            len(stderr) if stderr else 0,
+        )
+
+        log.trace("RELENV WFUNC STDOUT: %s", stdout)
+        log.trace("RELENV WFUNC STDERR: %s", stderr)
+        log.debug("RELENV WFUNC RETCODE: %s", retcode)
+
+        # Parse JSON output (same format as wrappers)
+        log.info("RELENV WFUNC: Calling _parse_salt_call_output()...")
+        result = self._parse_salt_call_output(stdout, stderr, retcode)
+        log.info("RELENV WFUNC: Returning result")
+        return result
+
+    def _build_salt_call_args(self):
+        """
+        Convert self.args and self.kwargs to salt-call command line format.
+
+        Examples:
+        - args=['foo', 'bar'] -> "foo bar"
+        - kwargs={'name': 'test', 'value': 123} -> "name=test value=123"
+        """
+        import shlex
+
+        args_list = []
+
+        # Positional arguments - properly quote and escape
+        for arg in self.args:
+            if isinstance(arg, (dict, list)):
+                # Complex types need JSON encoding
+                args_list.append(shlex.quote(salt.utils.json.dumps(arg)))
+            elif isinstance(arg, str):
+                # Simple strings just need quoting
+                args_list.append(shlex.quote(arg))
+            else:
+                # Numbers, booleans, etc.
+                args_list.append(shlex.quote(str(arg)))
+
+        # Keyword arguments - salt-call expects key=value format
+        for key, value in self.kwargs.items():
+            if isinstance(value, (dict, list)):
+                # Complex types need JSON encoding
+                args_list.append(f"{key}={shlex.quote(salt.utils.json.dumps(value))}")
+            elif isinstance(value, str):
+                args_list.append(f"{key}={shlex.quote(value)}")
+            else:
+                args_list.append(f"{key}={shlex.quote(str(value))}")
+
+        return " ".join(args_list)
+
+    def _parse_salt_call_output(self, stdout, stderr, retcode):
+        """
+        Parse JSON output from salt-call --local --out=json.
+
+        Salt-call outputs: {"local": <return_value>}
+        This matches the format expected by the wrapper system.
+
+        Returns tuple of (json_data, retcode)
+        """
+        try:
+            # Try to parse JSON output
+            result = salt.utils.json.loads(stdout)
+
+            # salt-call --local outputs: {"local": <return_value>}
+            # This is already in the correct format
+            if isinstance(result, dict) and "local" in result:
+                # Return retcode=0 for successful execution
+                # The retcode from salt-call is not what we want - that's the shell exit code
+                # We want to indicate success (0) when we successfully parsed the output
+                return salt.utils.json.dumps(result), 0
+            else:
+                # Unexpected format, wrap it
+                return salt.utils.json.dumps({"local": {"return": result}}), 0
+
+        except (ValueError, TypeError) as exc:
+            # JSON parsing failed - likely an error occurred
+            log.error(
+                "RELENV: Failed to parse salt-call output as JSON: %s\nSTDOUT: %s\nSTDERR: %s",
+                exc,
+                stdout,
+                stderr,
+            )
+
+            # Return error in the expected format with non-zero retcode
+            error_result = {
+                "local": {
+                    "error": "Failed to parse salt-call output",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exception": str(exc),
+                }
+            }
+            return salt.utils.json.dumps(error_result), retcode if retcode != 0 else 1
+
     def _cmd_str(self):
         """
         Prepare the command string
@@ -1597,6 +1913,31 @@ class Single:
             debug = "1"
 
         if self.opts.get("relenv"):
+            # Properly quote arguments for shell execution
+            import shlex
+
+            # If argv is a list with a single string element (common with wrappers),
+            # split it into proper arguments
+            if (
+                len(self.argv) == 1
+                and isinstance(self.argv[0], str)
+                and " " in self.argv[0]
+            ):
+                # Split the string into shell words
+                argv_to_use = shlex.split(self.argv[0])
+            else:
+                argv_to_use = self.argv
+
+            quoted_args = " ".join(shlex.quote(str(arg)) for arg in argv_to_use)
+            log.debug(
+                "RELENV: Building shim with argv=%s, argv_to_use=%s, quoted_args=%s",
+                self.argv,
+                argv_to_use,
+                quoted_args,
+            )
+
+            # Note: Config is sent separately via SCP in cmd_block() to avoid ARG_MAX issues
+            # The shim expects the config file to already exist at {THIN_DIR}/minion
             return SSH_SH_SHIM_RELENV.format(
                 DEBUG=debug,
                 SUDO=sudo,
@@ -1604,7 +1945,8 @@ class Single:
                 THIN_DIR=self.thin_dir,
                 SET_PATH=self.set_path,
                 RSTR=RSTR,
-                ARGS=" ".join(self.argv),
+                ARGS=quoted_args,
+                EXT_MODS_VERSION=self.mods.get("version", ""),
             )
 
         thin_code_digest, thin_sum = salt.utils.thin.thin_sum(cachedir, "sha1")
@@ -1686,6 +2028,21 @@ ARGS = {arguments}\n'''.format(
         execute it there
         """
         if not self.tty and not self.winrm:
+            # Debug: Log command string size to diagnose ARG_MAX issues
+            cmd_size = len(cmd_str)
+            if cmd_size > 100000:  # Log if > 100KB
+                log.warning(
+                    "RELENV: Large shim command detected: %d bytes (ARG_MAX is typically ~2MB). "
+                    "This may cause 'Argument list too long' errors.",
+                    cmd_size,
+                )
+                # Log first 500 and last 500 chars to see what's in it
+                log.debug(
+                    "RELENV: Command preview - first 500 chars: %s", cmd_str[:500]
+                )
+                log.debug(
+                    "RELENV: Command preview - last 500 chars: %s", cmd_str[-500:]
+                )
             return self.shell.exec_cmd(cmd_str)
 
         # Write the shim to a temporary file in the default temp directory
@@ -1725,11 +2082,90 @@ ARGS = {arguments}\n'''.format(
         5. split SHIM results from command results
         6. return command results
         """
+        # For both thin and relenv, use the shim system
+        # The shim handles extraction and execution
+        # For relenv, the shim (SSH_SH_SHIM_RELENV) calls salt-call directly
         self.argv = _convert_args(self.argv)
         log.debug(
             "Performing shimmed, blocking command as follows:\n%s",
             " ".join([str(arg) for arg in self.argv]),
         )
+
+        # For relenv, send minion config via SCP to avoid ARG_MAX issues
+        # The config file is expected to be at {THIN_DIR}/minion by the shim
+        if self.opts.get("relenv"):
+            remote_config_path = f"{self.thin_dir}/minion"
+
+            # Check if config file already exists on remote (for nested/wrapper calls)
+            # This avoids ARG_MAX issues when wrappers create nested Single instances
+            check_cmd = f"test -f {remote_config_path} && echo exists || echo missing"
+            check_result = self.shell.exec_cmd(check_cmd)
+
+            config_exists = (
+                check_result[0].strip() == "exists" if check_result[2] == 0 else False
+            )
+
+            if config_exists:
+                log.debug(
+                    "RELENV: Config file already exists at %s, skipping transfer (nested/wrapper call)",
+                    remote_config_path,
+                )
+            else:
+                # Write minion config to a temporary file
+                with tempfile.NamedTemporaryFile(
+                    mode="w", delete=False, suffix=".conf"
+                ) as config_tmp_file:
+                    config_tmp_file.write(self.minion_config)
+                    local_config_path = config_tmp_file.name
+
+                try:
+                    # SCP the config file to the target
+                    # makedirs=True ensures the thin_dir exists
+                    log.debug(
+                        "RELENV: Sending minion config to %s:%s",
+                        self.target["host"],
+                        remote_config_path,
+                    )
+                    send_result = self.shell.send(
+                        local_config_path, remote_config_path, makedirs=True
+                    )
+
+                    # Check if send failed
+                    if send_result and send_result[2] != 0:
+                        log.error(
+                            "RELENV: Failed to send minion config - stdout: %s, stderr: %s, retcode: %s",
+                            send_result[0],
+                            send_result[1],
+                            send_result[2],
+                        )
+                        return (
+                            f"ERROR: Failed to transfer minion config (retcode {send_result[2]}): {send_result[0] or send_result[1]}",
+                            send_result[1],
+                            send_result[2],
+                        )
+
+                    log.debug("RELENV: Successfully sent minion config")
+                finally:
+                    # Clean up temporary file
+                    try:
+                        os.unlink(local_config_path)
+                    except OSError as e:
+                        log.warning(
+                            "RELENV: Failed to delete temporary config file %s: %s",
+                            local_config_path,
+                            e,
+                        )
+
+        # Regenerate extension modules tarball with fresh fileserver scan
+        # This ensures that any dynamically-added modules (like test fixtures)
+        # are included and the version hash is up-to-date
+        log.debug("Regenerating extension modules tarball before command execution")
+        self.mods = mod_data(self.fsclient)
+
+        # Deploy the fresh tarball to the remote system
+        log.debug("Deploying extension modules tarball to remote system")
+        self.deploy_ext()
+
         cmd_str = self._cmd_str()
         stdout, stderr, retcode = self.shim_cmd(cmd_str)
 
@@ -1743,9 +2179,9 @@ ARGS = {arguments}\n'''.format(
                 saltwinshell.deploy_python(self)
                 stdout, stderr, retcode = self.shim_cmd(cmd_str)
                 while re.search(RSTR_RE, stdout):
-                    stdout = re.split(RSTR_RE, stdout, 1)[1].strip()
+                    stdout = re.split(RSTR_RE, stdout, maxsplit=1)[1].strip()
                 while re.search(RSTR_RE, stderr):
-                    stderr = re.split(RSTR_RE, stderr, 1)[1].strip()
+                    stderr = re.split(RSTR_RE, stderr, maxsplit=1)[1].strip()
             elif error == "Undefined SHIM state":
                 self.deploy()
                 stdout, stderr, retcode = self.shim_cmd(cmd_str)
@@ -1760,31 +2196,31 @@ ARGS = {arguments}\n'''.format(
                         retcode,
                     )
                 while re.search(RSTR_RE, stdout):
-                    stdout = re.split(RSTR_RE, stdout, 1)[1].strip()
+                    stdout = re.split(RSTR_RE, stdout, maxsplit=1)[1].strip()
                 while re.search(RSTR_RE, stderr):
-                    stderr = re.split(RSTR_RE, stderr, 1)[1].strip()
+                    stderr = re.split(RSTR_RE, stderr, maxsplit=1)[1].strip()
             else:
                 return f"ERROR: {error}", stderr, retcode
 
         # FIXME: this discards output from ssh_shim if the shim succeeds.  It should
         # always save the shim output regardless of shim success or failure.
         while re.search(RSTR_RE, stdout):
-            stdout = re.split(RSTR_RE, stdout, 1)[1].strip()
+            stdout = re.split(RSTR_RE, stdout, maxsplit=1)[1].strip()
 
         if re.search(RSTR_RE, stderr):
             # Found RSTR in stderr which means SHIM completed and only
             # and remaining output is only from salt.
             while re.search(RSTR_RE, stderr):
-                stderr = re.split(RSTR_RE, stderr, 1)[1].strip()
+                stderr = re.split(RSTR_RE, stderr, maxsplit=1)[1].strip()
 
         else:
             # RSTR was found in stdout but not stderr - which means there
             # is a SHIM command for the master.
-            shim_command = re.split(r"\r?\n", stdout, 1)[0].strip()
+            shim_command = re.split(r"\r?\n", stdout, maxsplit=1)[0].strip()
             log.debug("SHIM retcode(%s) and command: %s", retcode, shim_command)
             if (
-                "deploy" == shim_command
-                and retcode == salt.defaults.exitcodes.EX_THIN_DEPLOY
+                retcode == salt.defaults.exitcodes.EX_THIN_DEPLOY
+                or "deploy" == shim_command
             ):
                 self.deploy()
                 stdout, stderr, retcode = self.shim_cmd(cmd_str)
@@ -1811,13 +2247,17 @@ ARGS = {arguments}\n'''.format(
                             retcode,
                         )
                 while re.search(RSTR_RE, stdout):
-                    stdout = re.split(RSTR_RE, stdout, 1)[1].strip()
+                    stdout = re.split(RSTR_RE, stdout, maxsplit=1)[1].strip()
                 if self.tty:
                     stderr = ""
                 else:
                     while re.search(RSTR_RE, stderr):
-                        stderr = re.split(RSTR_RE, stderr, 1)[1].strip()
+                        stderr = re.split(RSTR_RE, stderr, maxsplit=1)[1].strip()
             elif "ext_mods" == shim_command:
+                # Regenerate extension modules tarball with fresh fileserver scan
+                # This ensures dynamically-added modules are included
+                log.info("ext_mods requested - regenerating extension modules tarball")
+                self.mods = mod_data(self.fsclient)
                 self.deploy_ext()
                 stdout, stderr, retcode = self.shim_cmd(cmd_str)
                 if not re.search(RSTR_RE, stdout) or not re.search(RSTR_RE, stderr):
@@ -1829,9 +2269,9 @@ ARGS = {arguments}\n'''.format(
                         retcode,
                     )
                 while re.search(RSTR_RE, stdout):
-                    stdout = re.split(RSTR_RE, stdout, 1)[1].strip()
+                    stdout = re.split(RSTR_RE, stdout, maxsplit=1)[1].strip()
                 while re.search(RSTR_RE, stderr):
-                    stderr = re.split(RSTR_RE, stderr, 1)[1].strip()
+                    stderr = re.split(RSTR_RE, stderr, maxsplit=1)[1].strip()
 
         return stdout, stderr, retcode
 
@@ -1983,6 +2423,8 @@ def mod_data(fsclient):
         "renderers",
         "returners",
         "utils",
+        "wrapper",
+        "tops",
     ]
     ret = {}
 
@@ -1992,12 +2434,20 @@ def mod_data(fsclient):
         try:
             # Use salt.loader._module_dirs but skip entry-points (saltexts handled by gen_thin)
             # This still discovers extension_modules from config and module_dirs from CLI
-            module_dirs = salt.loader._module_dirs(
-                opts, ref, tag=ref.rstrip("s"), load_extensions=False
-            )
+            kwargs = {"load_extensions": False}
+            if ref == "wrapper":
+                kwargs["tag"] = "wrapper"
+                kwargs["base_path"] = str(salt.loader.SALT_BASE_PATH / "client" / "ssh")
+            else:
+                kwargs["tag"] = ref.rstrip("s")
+            module_dirs = salt.loader._module_dirs(opts, ref, **kwargs)
 
             for mod_dir in module_dirs:
                 if not os.path.isdir(mod_dir):
+                    continue
+
+                # Skip internal salt modules - they should be in the thin/relenv tarball
+                if mod_dir.startswith(str(salt.loader.SALT_BASE_PATH)):
                     continue
 
                 for fn_ in os.listdir(mod_dir):
@@ -2010,7 +2460,8 @@ def mod_data(fsclient):
 
                         if ref not in ret:
                             ret[ref] = {}
-                        ret[ref][fn_] = mod_path
+                        if fn_ not in ret[ref]:
+                            ret[ref][fn_] = mod_path
         except Exception as exc:  # pylint: disable=broad-except
             log.debug(
                 "Failed to load %s modules from global loader: %s",
@@ -2044,7 +2495,8 @@ def mod_data(fsclient):
                                 if ref not in ret:
                                     ret[ref] = {}
                                 # Use basename to avoid duplicates
-                                ret[ref][fn_] = mod_path
+                                if fn_ not in ret[ref]:
+                                    ret[ref][fn_] = mod_path
                     except Exception as exc:  # pylint: disable=broad-except
                         log.debug(
                             "Failed to scan directory %s: %s",
@@ -2072,9 +2524,23 @@ def mod_data(fsclient):
     ver = hashlib.sha1(ver_base).hexdigest()
     ext_tar_path = os.path.join(fsclient.opts["cachedir"], f"ext_mods.{ver}.tgz")
     mods = {"version": ver, "file": ext_tar_path}
+
+    # Debug logging to track extension modules
+    states_found = ret.get("states", {})
+    log.debug(
+        "EXTMODS DEBUG: Found %d state modules: %s",
+        len(states_found),
+        list(states_found.keys()),
+    )
+    log.debug("EXTMODS DEBUG: Version hash: %s", ver)
+    log.debug("EXTMODS DEBUG: Tarball path: %s", ext_tar_path)
+    log.debug("EXTMODS DEBUG: Tarball exists: %s", os.path.isfile(ext_tar_path))
+
     if os.path.isfile(ext_tar_path):
+        log.debug("EXTMODS DEBUG: Using cached tarball")
         return mods
 
+    log.debug("EXTMODS DEBUG: Creating new tarball")
     # Ensure cache directory exists
     cache_dir = fsclient.opts["cachedir"]
     if not os.path.isdir(cache_dir):

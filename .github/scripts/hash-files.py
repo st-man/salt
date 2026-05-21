@@ -9,7 +9,7 @@ Usage:
     python hash-files.py 'pattern1' 'pattern2' ...
 
 Example:
-    python hash-files.py 'requirements/**/*.txt' 'noxfile.py'
+    python hash-files.py 'requirements/**/*' 'noxfile.py'
 """
 import hashlib
 import sys
@@ -21,7 +21,7 @@ def find_files(patterns):
     Find all files matching the given glob patterns.
 
     Args:
-        patterns: List of glob patterns (e.g., 'requirements/**/*.txt')
+        patterns: List of glob patterns (e.g., 'requirements/**/*')
 
     Returns:
         Sorted list of Path objects for matching files
@@ -108,7 +108,7 @@ def hash_files(file_paths):
                 # Read in chunks to handle large files efficiently
                 while chunk := f.read(8192):
                     hasher.update(chunk)
-        except (OSError, IOError) as e:
+        except OSError as e:
             # Print warning but continue with other files
             print(f"Warning: Could not read {file_path}: {e}", file=sys.stderr)
             continue
@@ -122,7 +122,7 @@ def main():
         print("Usage: python hash-files.py 'pattern1' 'pattern2' ...", file=sys.stderr)
         print("", file=sys.stderr)
         print(
-            "Example: python hash-files.py 'requirements/**/*.txt' 'noxfile.py'",
+            "Example: python hash-files.py 'requirements/**/*' 'noxfile.py'",
             file=sys.stderr,
         )
         sys.exit(1)

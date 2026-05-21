@@ -121,8 +121,16 @@ def generate_sls_context(tmplpath, sls):
         elif template.endswith(f"{slspath}/init.sls"):
             template = template[-(9 + len(slspath)) :]
         else:
-            # Something went wrong
-            log.warning("Failed to determine proper template path")
+            # It is not an SLS file being processed
+            template = sls
+            sls_context.update(
+                dict(
+                    tplpath=tmplpath,
+                    tplfile=template,
+                    tpldir=str(pathlib.Path(sls).parents[0].as_posix()),
+                )
+            )
+            return sls_context
 
         slspath = template.rsplit("/", 1)[0] if "/" in template else ""
 
@@ -191,7 +199,9 @@ def wrap_tmpl_func(render_str):
                 try:
                     if tmplpath is not None:
                         tmplsrc = os.path.join(tmplpath, tmplsrc)
-                    with codecs.open(tmplsrc, "r", SLS_ENCODING) as _tmplsrc:
+                    with salt.utils.files.fopen(
+                        tmplsrc, encoding=SLS_ENCODING
+                    ) as _tmplsrc:
                         tmplstr = _tmplsrc.read()
                 except (UnicodeDecodeError, ValueError, OSError) as exc:
                     if salt.utils.files.is_binary(tmplsrc):

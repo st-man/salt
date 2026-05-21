@@ -55,6 +55,26 @@ def salt_master_factory(salt_factories):
         "publish_signing_algorithm": (
             "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1"
         ),
+        "worker_pools_enabled": True,
+        "worker_pools": {
+            "fast": {
+                "worker_count": 2,
+                "commands": [
+                    "test.ping",
+                    "test.echo",
+                    "test.fib",
+                    "grains.items",
+                    "sys.doc",
+                    "pillar.items",
+                    "runner.test.arg",
+                    "auth",
+                ],
+            },
+            "general": {
+                "worker_count": 3,
+                "commands": ["*"],
+            },
+        },
     }
     factory = salt_factories.salt_master_daemon(
         random_string("swarm-master-"),
@@ -94,17 +114,11 @@ def _minion_count(grains):
     env_count = os.environ.get("SALT_CI_MINION_SWARM_COUNT")
     if env_count is not None:
         return int(env_count)
-    # Default to 15 swarm minions
-    count = 15
-    if grains["osarch"] != "aarch64":
-        return count
-    if grains["os"] != "Amazon":
-        return count
-    if grains["osmajorrelease"] != 2023:
-        return count
-    # Looks like the test suite on Amazon 2023 under ARM64 get's OOM killed
-    # Let's reduce the number of swarm minions
-    return count - 5
+    # Use 5 swarm minions by default - enough to test swarm behavior while
+    # keeping CI runners under the ~90% CPU/memory load they already carry
+    # from earlier scenario tests.  The old default of 15 caused SIGTERM
+    # kills on Debian 13 and Fedora 40 CI runs.
+    return 5
 
 
 @pytest.fixture(scope="package")

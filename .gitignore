@@ -6,6 +6,7 @@ pkg/arch/*.tar.xz
 *.sw[a-p]
 doc/_build
 doc/doc-archive.tar.gz
+doc/man-archive.tar.xz
 dist
 MANIFEST
 *~
@@ -145,3 +146,15 @@ nox.*.tar.xz
 /pkg/debian/debhelper-build-stamp
 
 .tools-venvs
+
+# AI Agent instruction files (templates are in agents/)
+/CLAUDE.md
+/GEMINI.md
+/CURSOR.md
+/COPILOT.md
+/.cursorrules
+/.aiderignore
+/aider.conf.yml
+/.gemini
+venv311/
+venv312/

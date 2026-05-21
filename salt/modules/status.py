@@ -22,6 +22,7 @@ import salt.utils.network
 import salt.utils.path
 import salt.utils.platform
 import salt.utils.stringutils
+import salt.utils.timeutil
 from salt.exceptions import CommandExecutionError
 
 log = logging.getLogger(__file__)
@@ -255,8 +256,8 @@ def uptime():
         return __salt__["cmd.run"]("uptime")
 
     # Setup datetime and timedelta objects
-    boot_time = datetime.datetime.utcfromtimestamp(curr_seconds - seconds)
-    curr_time = datetime.datetime.utcfromtimestamp(curr_seconds)
+    boot_time = salt.utils.timeutil.utcfromtimestamp(curr_seconds - seconds)
+    curr_time = salt.utils.timeutil.utcfromtimestamp(curr_seconds)
     up_time = curr_time - boot_time
 
     # Construct return information
@@ -1051,11 +1052,15 @@ def diskusage(*args):
     ret = {}
     for path in selected:
         if os.path.exists(path):
-            fsstats = os.statvfs(path)
-            blksz = fsstats.f_bsize
-            available = fsstats.f_bavail * blksz
-            total = fsstats.f_blocks * blksz
-            ret[path] = {"available": available, "total": total}
+            try:
+                fsstats = os.statvfs(path)
+                blksz = fsstats.f_bsize
+                available = fsstats.f_bavail * blksz
+                total = fsstats.f_blocks * blksz
+                ret[path] = {"available": available, "total": total}
+            except OSError as exc:
+                log.warning("Cannot get stats from '%s': %s", path, exc)
+                ret[path] = {"available": None, "total": None}
     return ret
 
 

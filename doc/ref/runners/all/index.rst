@@ -11,6 +11,7 @@ runner modules
     :template: autosummary.rst.tmpl
 
     auth
+    batch
     cache
     config
     doc
@@ -26,6 +27,7 @@ runner modules
     net
     network
     pillar
+    pki
     queue
     reactor
     salt

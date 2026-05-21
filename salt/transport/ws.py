@@ -143,7 +143,18 @@ class PublishClient(salt.transport.base.PublishClient):
                     else:
                         url = "http://ipc.saltproject.io/ws"
                 log.debug("pub client connect %r %r", url, ctx)
-                ws = await asyncio.wait_for(session.ws_connect(url, ssl=ctx), 3)
+                ws = await asyncio.wait_for(
+                    session.ws_connect(url, ssl=ctx),
+                    timeout if timeout is not None else 5,
+                )
+                # For SSL connections, give handshake time to complete and fail if invalid
+                if ws and self.ssl:
+                    await asyncio.sleep(0.1)
+                    if ws.closed:
+                        log.debug("WS closed after SSL handshake")
+                        ws = None
+                        await session.close()
+                        continue
             except Exception as exc:  # pylint: disable=broad-except
                 log.warning(
                     "WS Message Client encountered an exception while connecting to"
@@ -336,10 +347,14 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         publish_payload,
         presence_callback=None,
         remove_presence_callback=None,
+        secrets=None,
+        started=None,
     ):
         """
         Bind to the interface specified in the configuration file
         """
+        if started is not None:
+            self.started = started
         # Use asyncio event loop directly like ZeroMQ does
         io_loop = salt.utils.asynchronous.aioloop(tornado.ioloop.IOLoop())
 
@@ -435,7 +450,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
             for msg in unpacker:
                 await self._pub_payload(msg)
 
-    def pre_fork(self, process_manager):
+    def pre_fork(self, process_manager, *args, **kwargs):
         """
         Do anything necessary pre-fork. Since this is on the master side this will
         primarily be used to create IPC channels and create our daemon process to
@@ -467,6 +482,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
                     break
         finally:
             self.clients.discard(ws)
+        return ws
 
     async def _connect(self):
         if self.pull_path:
@@ -520,8 +536,10 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
         self.opts = opts
         self.site = None
         self.ssl = self.opts.get("ssl", None)
+        self._run = None
+        self._socket = None
 
-    def pre_fork(self, process_manager):
+    def pre_fork(self, process_manager, *args, **kwargs):
         """
         Pre-fork we need to create the zmq router device
         """
@@ -533,13 +551,24 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
                 name="LoadBalancerServer",
             )
         elif not salt.utils.platform.is_windows():
-            self._socket = _get_socket(self.opts)
-            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            _set_tcp_keepalive(self._socket, self.opts)
-            self._socket.setblocking(0)
-            self._socket.bind(_get_bind_addr(self.opts, "ret_port"))
+            if self.opts.get("ipc_mode") == "ipc" and self.opts.get("workers_ipc_name"):
+                self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._socket.setblocking(0)
+                ipc_path = os.path.join(
+                    self.opts["sock_dir"], self.opts["workers_ipc_name"]
+                )
+                if os.path.exists(ipc_path):
+                    os.unlink(ipc_path)
+                self._socket.bind(ipc_path)
+                os.chmod(ipc_path, 0o600)
+            else:
+                self._socket = _get_socket(self.opts)
+                self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                _set_tcp_keepalive(self._socket, self.opts)
+                self._socket.setblocking(0)
+                self._socket.bind(_get_bind_addr(self.opts, "ret_port"))
 
-    def post_fork(self, message_handler, io_loop):
+    def post_fork(self, message_handler, io_loop, **kwargs):
         """
         After forking we need to create all of the local sockets to listen to the
         router
@@ -559,7 +588,7 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
             await runner.setup()
             ctx = None
             if self.ssl is not None:
-                ctx = tornado.netutil.ssl_options_to_context(self.ssl, server_side=True)
+                ctx = salt.transport.base.ssl_context(self.ssl, server_side=True)
             self.site = aiohttp.web.SockSite(runner, self._socket, ssl_context=ctx)
             log.info("Worker binding to socket %s", self._socket)
             await self.site.start()
@@ -594,13 +623,28 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
                 await ws.send_bytes(salt.payload.dumps(reply))
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 log.error("ws connection closed with exception %s", ws.exception())
+        return ws
 
     def close(self):
-        self._run.set()  # Signal shutdown
+        if self._run is not None:
+            self._run.set()  # Signal shutdown
         if self._socket is not None:
             self._socket.shutdown(socket.SHUT_RDWR)
             self._socket.close()
             self._socket = None
+
+    async def forward_message(self, payload):
+        """
+        Forward a message into this transport's worker queue.
+
+        Not implemented for WebSocket transport. Worker pool routing is only
+        supported for ZeroMQ transport.
+        """
+        log.warning(
+            "Worker pool message forwarding is not supported for WebSocket transport. "
+            "Use ZeroMQ transport for worker pool routing."
+        )
+        return None
 
 
 class RequestClient(salt.transport.base.RequestClient):
@@ -620,9 +664,18 @@ class RequestClient(salt.transport.base.RequestClient):
     async def connect(self):  # pylint: disable=invalid-overridden-method
         ctx = None
         if self.ssl is not None:
-            ctx = tornado.netutil.ssl_options_to_context(self.ssl, server_side=False)
-        self.session = aiohttp.ClientSession()
-        URL = self.get_master_uri(self.opts)
+            ctx = salt.transport.base.ssl_context(self.ssl, server_side=False)
+
+        master_uri = self.opts.get("master_uri", "")
+        if master_uri.startswith("ipc://"):
+            socket_path = master_uri[6:]
+            connector = aiohttp.UnixConnector(path=socket_path)
+            self.session = aiohttp.ClientSession(connector=connector)
+            URL = "http://localhost/ws"
+        else:
+            self.session = aiohttp.ClientSession()
+            URL = self.get_master_uri(self.opts)
+
         log.debug("Connect to %s %s", URL, ctx)
         self.ws = await self.session.ws_connect(URL, ssl=ctx)
 

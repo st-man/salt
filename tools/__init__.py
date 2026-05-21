@@ -18,7 +18,7 @@ DEFAULT_REQS_CONFIG = DefaultPipConfig(
         f"--constraint={REQUIREMENTS_FILES_PATH / 'constraints.txt'}",
     ],
     requirements_files=[
-        CI_REQUIREMENTS_FILES_PATH / "tools.txt",
+        CI_REQUIREMENTS_FILES_PATH / "tools.lock",
     ],
 )
 RELEASE_VENV_CONFIG = VirtualEnvPipConfig(
@@ -27,7 +27,7 @@ RELEASE_VENV_CONFIG = VirtualEnvPipConfig(
         f"--constraint={REQUIREMENTS_FILES_PATH / 'constraints.txt'}",
     ],
     requirements_files=[
-        CI_REQUIREMENTS_FILES_PATH / "tools-virustotal.txt",
+        CI_REQUIREMENTS_FILES_PATH / "tools-virustotal.lock",
     ],
     add_as_extra_site_packages=True,
 )
@@ -49,6 +49,9 @@ ptscripts.register_tools_module("tools.precommit.loader")
 ptscripts.register_tools_module("tools.release", venv_config=RELEASE_VENV_CONFIG)
 ptscripts.register_tools_module("tools.testsuite")
 ptscripts.register_tools_module("tools.testsuite.download")
+ptscripts.register_tools_module("tools.testsuite.pytest")
+ptscripts.register_tools_module("tools.testsuite.ci_failure")
+ptscripts.register_tools_module("tools.testsuite.container_test")
 
 for name in ("boto3", "botocore", "urllib3"):
     logging.getLogger(name).setLevel(logging.INFO)
