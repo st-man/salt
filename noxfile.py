@@ -200,12 +200,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     if IS_WINDOWS:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "windows.txt"
+                "requirements", "static", requirements_type, pydir, "windows.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "windows-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "windows-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -213,12 +213,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     elif IS_DARWIN:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "darwin.txt"
+                "requirements", "static", requirements_type, pydir, "darwin.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "darwin-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "darwin-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -226,12 +226,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     elif IS_FREEBSD:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "freebsd.txt"
+                "requirements", "static", requirements_type, pydir, "freebsd.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "freebsd-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "freebsd-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -239,12 +239,12 @@ def _get_pip_requirements_file(session, crypto=None, requirements_type="ci"):
     else:
         if crypto is None:
             _requirements_file = os.path.join(
-                "requirements", "static", requirements_type, pydir, "linux.txt"
+                "requirements", "static", requirements_type, pydir, "linux.lock"
             )
             if os.path.exists(_requirements_file):
                 return _requirements_file
         _requirements_file = os.path.join(
-            "requirements", "static", requirements_type, pydir, "linux-crypto.txt"
+            "requirements", "static", requirements_type, pydir, "linux-crypto.lock"
         )
         if os.path.exists(_requirements_file):
             return _requirements_file
@@ -933,10 +933,10 @@ def test_cloud(session, coverage):
     # Install requirements
     if _upgrade_pip_setuptools_and_wheel(session):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", pydir, "linux.txt"
+            "requirements", "static", "ci", pydir, "linux.lock"
         )
         cloud_requirements_file = os.path.join(
-            "requirements", "static", "ci", pydir, "cloud.txt"
+            "requirements", "static", "ci", pydir, "cloud.lock"
         )
 
         install_command = [
@@ -1446,7 +1446,7 @@ def pre_archive_cleanup(session, pkg):
 
     if _upgrade_pip_setuptools_and_wheel(session):
         requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "tools.txt"
+            "requirements", "static", "ci", _get_pydir(session), "tools.lock"
         )
         install_command = ["--progress-bar=off", "-r", requirements_file]
         session.install(*install_command, silent=PIP_INSTALL_SILENT)
@@ -1542,10 +1542,10 @@ class Tee:
 def _lint(session, rcfile, flags, paths, upgrade_setuptools_and_pip=True):
     if _upgrade_pip_setuptools_and_wheel(session, upgrade=upgrade_setuptools_and_pip):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "linux.txt"
+            "requirements", "static", "ci", _get_pydir(session), "linux.lock"
         )
         lint_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "lint.txt"
+            "requirements", "static", "ci", _get_pydir(session), "lint.lock"
         )
         install_command = [
             "--progress-bar=off",
@@ -1684,12 +1684,12 @@ def docs_html(session, compress, clean):
     """
     if _upgrade_pip_setuptools_and_wheel(session):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "linux.txt"
+            "requirements", "static", "ci", _get_pydir(session), "linux.lock"
         )
-        base_requirements_file = os.path.join("requirements", "base.txt")
-        zeromq_requirements_file = os.path.join("requirements", "zeromq.txt")
+        base_requirements_file = os.path.join("requirements", "base.in")
+        zeromq_requirements_file = os.path.join("requirements", "zeromq.in")
         docs_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "docs.txt"
+            "requirements", "static", "ci", _get_pydir(session), "docs.lock"
         )
         install_command = [
             "--progress-bar=off",
@@ -1722,12 +1722,12 @@ def docs_man(session, compress, update, clean):
     """
     if _upgrade_pip_setuptools_and_wheel(session):
         linux_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "linux.txt"
+            "requirements", "static", "ci", _get_pydir(session), "linux.lock"
         )
-        base_requirements_file = os.path.join("requirements", "base.txt")
-        zeromq_requirements_file = os.path.join("requirements", "zeromq.txt")
+        base_requirements_file = os.path.join("requirements", "base.in")
+        zeromq_requirements_file = os.path.join("requirements", "zeromq.in")
         docs_requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "docs.txt"
+            "requirements", "static", "ci", _get_pydir(session), "docs.lock"
         )
         install_command = [
             "--progress-bar=off",
@@ -1766,7 +1766,7 @@ def changelog(session, draft, force):
     )
     if _upgrade_pip_setuptools_and_wheel(session):
         requirements_file = os.path.join(
-            "requirements", "static", "ci", _get_pydir(session), "tools.txt"
+            "requirements", "static", "ci", _get_pydir(session), "tools.lock"
         )
         install_command = ["--progress-bar=off", "-r", requirements_file]
         session.install(*install_command, silent=PIP_INSTALL_SILENT)
@@ -1851,7 +1851,7 @@ def build(session):
         session.install(
             "--progress-bar=off",
             "-r",
-            "requirements/build.txt",
+            "requirements/build.in",
             silent=PIP_INSTALL_SILENT,
         )
 

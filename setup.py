@@ -120,9 +120,9 @@ SALT_SYSPATHS_HARDCODED = os.path.join(
     os.path.abspath(SETUP_DIRNAME), "salt", "_syspaths.py"
 )
 SALT_BASE_REQUIREMENTS = [
-    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "base.txt"),
+    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "base.in"),
     # pyzmq needs to be installed regardless of the salt transport
-    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "zeromq.txt"),
+    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "zeromq.in"),
 ]
 SALT_LINUX_LOCKED_REQS = [
     # Linux packages defined locked requirements
@@ -132,11 +132,11 @@ SALT_LINUX_LOCKED_REQS = [
         "static",
         "pkg",
         "py{}.{}".format(*sys.version_info),
-        "linux.txt",
+        "linux.lock",
     )
 ]
 SALT_OSX_REQS = SALT_BASE_REQUIREMENTS + [
-    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "darwin.txt")
+    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "darwin.in")
 ]
 SALT_OSX_LOCKED_REQS = [
     # OSX packages already defined locked requirements
@@ -146,11 +146,11 @@ SALT_OSX_LOCKED_REQS = [
         "static",
         "pkg",
         "py{}.{}".format(*sys.version_info),
-        "darwin.txt",
+        "darwin.lock",
     )
 ]
 SALT_WINDOWS_REQS = SALT_BASE_REQUIREMENTS + [
-    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "windows.txt")
+    os.path.join(os.path.abspath(SETUP_DIRNAME), "requirements", "windows.in")
 ]
 SALT_WINDOWS_LOCKED_REQS = [
     # Windows packages already defined locked requirements
@@ -160,7 +160,7 @@ SALT_WINDOWS_LOCKED_REQS = [
         "static",
         "pkg",
         "py{}.{}".format(*sys.version_info),
-        "windows.txt",
+        "windows.lock",
     )
 ]
 SALT_LONG_DESCRIPTION_FILE = os.path.join(os.path.abspath(SETUP_DIRNAME), "README.rst")
@@ -173,7 +173,9 @@ PACKAGED_FOR_SALT_SSH = os.path.isfile(PACKAGED_FOR_SALT_SSH_FILE)
 
 
 # pylint: disable=W0122
-if os.path.exists(SALT_VERSION_HARDCODED):
+if os.environ.get("SALT_VERSION"):
+    SALT_VERSION = os.environ.get("SALT_VERSION")
+elif os.path.exists(SALT_VERSION_HARDCODED):
     with open(SALT_VERSION_HARDCODED, encoding="utf-8") as rfh:
         SALT_VERSION = rfh.read().strip()
 else:
@@ -616,20 +618,10 @@ class Build(build):
         build.run(self)
         salt_build_ver_file = os.path.join(self.build_lib, "salt", "_version.txt")
 
-        if getattr(self.distribution, "with_salt_version", False):
-            # Write the hardcoded salt version module salt/_version.txt
-            self.distribution.salt_version_hardcoded_path = salt_build_ver_file
-            self.run_command("write_salt_version")
-
-        if getattr(self.distribution, "build_egg", False):
-            # we are building an egg package. need to include _version.txt
-            self.distribution.salt_version_hardcoded_path = salt_build_ver_file
-            self.run_command("write_salt_version")
-
-        if getattr(self.distribution, "build_wheel", False):
-            # we are building a wheel package. need to include _version.txt
-            self.distribution.salt_version_hardcoded_path = salt_build_ver_file
-            self.run_command("write_salt_version")
+        # ALWAYS write the version file during build, so it's included in wheels built by PEP 517
+        log.info("Generating %s", salt_build_ver_file)
+        with open(salt_build_ver_file, "w", encoding="utf-8") as wfh:
+            wfh.write(str(SALT_VERSION))
 
         if getattr(self.distribution, "running_salt_install", False):
             # If our install attribute is present and set to True, we'll go
